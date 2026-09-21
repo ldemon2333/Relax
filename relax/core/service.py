@@ -98,6 +98,8 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        if str(self.role) in {"rollout", "genrm"}:
+            ray_actor_options.update(num_gpus=0)
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env

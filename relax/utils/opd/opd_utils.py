@@ -191,6 +191,7 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
+    args._managed_opd_teacher_model_ids = ()
     if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
         return None, None
 
@@ -241,6 +242,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
     )
     args.opd_teacher_url = urls[0]
     args.opd_teacher_urls = list(urls)
+    args._managed_opd_teacher_model_ids = ("__default__",)
     logger.info(
         f"[OPD teacher] injected opd_teacher_url={args.opd_teacher_url} "
         f"opd_teacher_urls={args.opd_teacher_urls} ({len(urls)} replica(s))"
@@ -379,6 +381,7 @@ def _start_managed_multi_teacher(
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
+    args._managed_opd_teacher_model_ids = tuple(managers)
     opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
     logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
 
@@ -388,6 +391,18 @@ def _start_managed_multi_teacher(
     # this function's existing (pg, list[manager]) contract for callers that use
     # isinstance(x, list) to normalize single- vs multi-teacher shapes.
     return shared_pg, list(managers.values())
+
+
+def managed_opd_teacher_managers_by_model(args: Any, teacher_manager: Any) -> dict[str, Any]:
+    if teacher_manager is None:
+        return {}
+    managers = teacher_manager if isinstance(teacher_manager, list) else [teacher_manager]
+    model_ids = getattr(args, "_managed_opd_teacher_model_ids", ())
+    if not isinstance(model_ids, (tuple, list)) or len(model_ids) != len(managers):
+        raise ValueError("Managed Teacher handles do not match their recorded model identities")
+    if any(not isinstance(key, str) or not key for key in model_ids) or len(set(model_ids)) != len(model_ids):
+        raise ValueError("Managed Teacher model identities must be unique nonempty strings")
+    return dict(zip(model_ids, managers, strict=True))
 
 
 async def set_managed_opd_teacher_on_actor_service(actor_service: Any, teacher_manager: Any, args: Any) -> None:

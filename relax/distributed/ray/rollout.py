@@ -3463,7 +3463,14 @@ class RolloutManager(ReloadableMixin):
                     "capabilities": ["generate", "chat"],
                 }
             default_model = next(iter(models)) if len(models) == 1 else None
-            return observation.registry.publish(models, routing=RoutingSpec(default_model=default_model))
+            served_names: dict[str, list[str]] = {}
+            for name, model in models.items():
+                if model.get("served_model_name"):
+                    served_names.setdefault(model["served_model_name"], []).append(name)
+            aliases = {name: ids[0] for name, ids in served_names.items() if len(ids) == 1 and name not in models}
+            return observation.registry.publish(
+                models, routing=RoutingSpec(default_model=default_model, aliases=aliases)
+            )
 
     @ray.method(concurrency_group="scale_out")
     def get_engines_info(self, model_name: Optional[str] = None) -> dict:

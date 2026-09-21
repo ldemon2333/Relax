@@ -64,7 +64,7 @@ async def test_client_does_not_mutate_payload_or_snapshot_and_forwards_affinity(
         async with InferenceClient(snapshot_provider=provider, http_client=http) as client:
             returned = await client.snapshot()
             returned["models"].clear()
-            await client.generate(payload, affinity_key="group-4")
+            await client.generate(payload, affinity_key="group-4", headers={"x-smg-routing-key": "group-4"})
     assert payload == original
     assert list(snapshot["models"]) == ["math"]
     assert requests[0].headers["X-SMG-Routing-Key"] == "group-4"

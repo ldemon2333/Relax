@@ -62,9 +62,14 @@ class RoleDiscovery:
                 for engine in model_data["engines"]:
                     engine["engine_id"] = f"{model_id}/{parsed.registry_epoch}/{engine['engine_id']}"
                 models.append(ModelSnapshot.from_dict(model_data))
+            served_names: dict[str, list[str]] = {}
+            for model in models:
+                if model.served_model_name:
+                    served_names.setdefault(model.served_model_name, []).append(model.model_id)
             routing = RoutingSpec(
                 default_model=items[0][0] if len(items) == 1 else None,
                 route_key_map={key: key for key, _ in items},
+                aliases={name: ids[0] for name, ids in served_names.items() if len(ids) == 1 and name not in managers},
             )
             if source_revisions != self._source_revisions:
                 self.registry.invalidate()

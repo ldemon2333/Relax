@@ -24,6 +24,7 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
+from relax.components.inference_gateway import InferenceGateway
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
@@ -39,6 +40,7 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
+    managed_opd_teacher_managers_by_model,
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
@@ -166,6 +168,8 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._teacher_gateway = None
+        self._teacher_gateway_owned = False
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -221,6 +225,7 @@ class Controller:
         try:
             self.register_all_serve()
         except Exception as e:
+            self._shutdown_teacher_gateway()
             self._report_error_to_metrics_service(e)
             raise
 
@@ -369,6 +374,44 @@ class Controller:
         )
         serve.run(deployment, name="metrics", route_prefix="/metrics")
         logger.info("MetricsService deployed at /metrics")
+
+    def _deploy_teacher_gateway(self) -> None:
+        if getattr(self, "_teacher_gateway_owned", False):
+            return
+        managers = managed_opd_teacher_managers_by_model(self.config, getattr(self, "_teacher_manager", None))
+        if not managers:
+            return
+        if any(str(role) == "teacher" for role in self.serve_dict):
+            raise RuntimeError("Teacher inference already has a role application")
+
+        deployment = InferenceGateway.options(
+            ray_actor_options=with_control_plane_affinity(
+                self.config,
+                {
+                    "num_cpus": 1,
+                    "num_gpus": 0,
+                    "runtime_env": getattr(self, "runtime_env", None),
+                },
+            )
+        ).bind(role="teacher", managers=managers)
+        self._teacher_gateway_owned = True
+        try:
+            self._teacher_gateway = serve.run(deployment, name="teacher", route_prefix="/teacher")
+        except Exception:
+            self._shutdown_teacher_gateway()
+            raise
+        logger.info("Teacher InferenceGateway deployed at /teacher")
+
+    def _shutdown_teacher_gateway(self) -> None:
+        if not getattr(self, "_teacher_gateway_owned", False):
+            return
+        try:
+            serve.delete("teacher")
+        except Exception as exc:
+            logger.warning(f"Failed to delete Teacher InferenceGateway: {exc}")
+            return
+        self._teacher_gateway = None
+        self._teacher_gateway_owned = False
 
     def _deploy_autoscaler_service(self):
         """Deploy the AutoscalerService as a lightweight Ray Serve deployment.
@@ -731,6 +774,7 @@ class Controller:
             self.config,
             runtime_env=self.runtime_env,
         )
+        self._deploy_teacher_gateway()
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -1002,6 +1046,7 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
+        self._shutdown_teacher_gateway()
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
@@ -1226,6 +1271,8 @@ class Controller:
         # the workers.  Without this, the main thread stays blocked on stale
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
+        self._shutdown_teacher_gateway()
+        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():

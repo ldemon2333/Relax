@@ -167,7 +167,7 @@ class InferenceClient:
     ) -> httpx.Response:
         target = await self._request_target(payload, model, route_key, affinity_key)
         outgoing = self._outgoing_payload(path, payload, target)
-        forward_headers = dict(headers or {})
+        forward_headers = httpx.Headers(headers or {})
         if affinity_key is not None:
             forward_headers.setdefault("X-SMG-Routing-Key", affinity_key)
         try:
@@ -203,7 +203,7 @@ class InferenceClient:
             self._request_target(payload, model, route_key, affinity_key), timeout=self.timeout
         )
         outgoing = self._outgoing_payload(path, payload, target)
-        forward_headers = dict(headers or {})
+        forward_headers = httpx.Headers(headers or {})
         if affinity_key is not None:
             forward_headers.setdefault("X-SMG-Routing-Key", affinity_key)
         response = None

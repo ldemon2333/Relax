@@ -193,10 +193,13 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
 
-    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {
+    expected_options = {
         "runtime_env": {"env_vars": {"A": "B"}},
         "resources": {"stable_cpu": 1},
     }
+    if has_data_source:
+        expected_options.update(num_gpus=0)
+    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == expected_options
     deployment.bind.assert_called_once()
 
 
