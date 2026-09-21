@@ -189,6 +189,241 @@ class InferenceManager:
         if not skip_init:
             self._init_engines(list(range(num_slots)))
 
+    @classmethod
+    def for_rollout(cls, args: Any = None, servers: dict | None = None) -> "InferenceManager":
+        owner = cls(args, num_slots=0, engine_actor_cls=object, skip_init=True, log_prefix="Rollout")
+        owner._inference_role = "rollout"
+        owner._inference_observation = _InferenceObservation("rollout")
+        owner.servers = servers if servers is not None else {}
+        owner.status = None
+        owner.health_monitors = []
+        owner._rollout_initialized = servers is not None
+        return owner
+
+    def initialize_rollout(self, start_factory: Any, pg: Any) -> dict:
+        with self._lifecycle_lock:
+            if self._rollout_initialized:
+                return self.servers
+            try:
+                self.servers = start_factory(self.args, pg)
+            except InferenceCleanupError as exc:
+                self.servers = getattr(exc, "rollout_servers", {})
+                self.status = "failed"
+                self._failed_startup_owner = getattr(exc, "cleanup_owner", None)
+                raise
+            self._rollout_initialized = True
+            for server in self.servers.values():
+                for group in server.engine_groups:
+                    group.pg_owned = False
+            for key, workers in self.rollout_replicas().items():
+                if workers and all(worker is not None for worker in workers):
+                    self._inference_observation.initialized(key, workers, weights_ready=False)
+                    self._inference_observation.entries[key]["initial_weight_probe"] = True
+            return self.servers
+
+    def rollout_replicas(self, model_name: str | None = None) -> dict[str, list[Any]]:
+        replicas = {}
+        for name, server in self.servers.items():
+            if model_name is not None and name != model_name:
+                continue
+            for group in self._active_rollout_groups(server):
+                for head in range(0, len(group.all_engines), group.nodes_per_engine):
+                    key = f"{name}/group-{group.rank_offset}/replica-{head // group.nodes_per_engine}"
+                    replicas[key] = group.all_engines[head : head + group.nodes_per_engine]
+        return replicas
+
+    @staticmethod
+    def _active_rollout_groups(server: Any) -> list[Any]:
+        groups = []
+        for group in server.engine_groups:
+            if not getattr(group, "is_scaled_out", False):
+                groups.append(group)
+                continue
+            status = getattr(group, "lifecycle_status", "ACTIVE")
+            if getattr(status, "value", status) == "ACTIVE":
+                groups.append(group)
+        return groups
+
+    def get_rollout_engines_and_lock(self, model_name: str | None, lock: Any) -> tuple:
+        server = self.servers.get(model_name) if model_name is not None else next(iter(self.servers.values()), None)
+        if server is None:
+            return [], lock, 0, [], []
+        groups = self._active_rollout_groups(server)
+        engines = [engine for group in groups for engine in group.engines]
+        counts = [group.num_gpus_per_engine for group in groups for _engine in group.engines]
+        offsets = [
+            group.gpu_offset + index * group.num_gpus_per_engine
+            for group in groups
+            for index, _engine in enumerate(group.engines)
+        ]
+        return engines, lock, sum(group.num_new_engines for group in groups), counts, offsets
+
+    def adopt_group(self, model_id: str, group: Any, *, owned_pg: bool) -> None:
+        with self._lifecycle_lock:
+            server = self.servers[model_id]
+            if group in server.engine_groups:
+                if getattr(group, "pg_owned", False) != owned_pg:
+                    raise ValueError("Engine group ownership cannot change after publication")
+                return
+            group.pg_owned = owned_pg
+            server.engine_groups.append(group)
+            self._inference_observation.registry.invalidate()
+
+    def remove_group(self, model_id: str, group: Any) -> None:
+        with self._lifecycle_lock:
+            server = self.servers[model_id]
+            if group not in server.engine_groups:
+                return
+            if any(engine is not None for engine in group.all_engines):
+                raise InferenceCleanupError("Cannot remove a group with live or unconfirmed workers")
+            if getattr(group, "pg_owned", False) and group.pg is not None:
+                pg = group.pg[0]
+                other_live = any(
+                    other is not group and other.pg is not None and other.pg[0] == pg
+                    for pool in self.servers.values()
+                    for other in pool.engine_groups
+                )
+                if not other_live:
+                    remove_placement_group(pg)
+            server.engine_groups.remove(group)
+            self._inference_observation.registry.invalidate()
+
+    def _rollout_memory(self, method: str, tags: Optional[list[str]] = None) -> None:
+        with self._lifecycle_lock:
+            observation = self._inference_observation
+            requested = set(_RESIDENT_TAGS if tags is None else tags)
+            if not requested.issubset(_RESIDENT_TAGS):
+                raise ValueError("Unknown inference memory tags")
+            errors = []
+            restored = []
+            for key, workers in self.rollout_replicas().items():
+                if not workers or all(worker is None for worker in workers):
+                    continue
+                if any(worker is None for worker in workers):
+                    errors.append(
+                        InferenceCleanupError("Incomplete Rollout replica requires confirmed cleanup before reuse")
+                    )
+                    continue
+                entry = observation.observe(key, workers)
+                if method == "release_memory_occupation" and entry["state"] == "SLEEPING":
+                    continue
+                missing = requested - entry["tags"]
+                if method == "resume_memory_occupation" and entry["state"] == "FAILED":
+                    errors.append(
+                        InferenceCleanupError(
+                            "Failed Rollout memory operation requires confirmed offload before restore"
+                        )
+                    )
+                    continue
+                if method == "resume_memory_occupation" and not missing:
+                    continue
+                observed = observation.begin(
+                    {key: workers}, "DRAINING" if method == "release_memory_occupation" else "ONLOADING"
+                )
+                try:
+                    kwargs = (
+                        {}
+                        if method == "release_memory_occupation"
+                        else {"tags": None if missing == _RESIDENT_TAGS else sorted(missing)}
+                    )
+                    ray.get(getattr(workers[0], method).remote(**kwargs), timeout=_ENGINE_OPERATION_TIMEOUT_S)
+                    if method == "release_memory_occupation":
+                        observation.offloaded(
+                            observed, preserve_weights=getattr(self.args, "_inference_preserve_rollout_weights", False)
+                        )
+                        entry["initial_weight_probe"] = False
+                    else:
+                        observation.onloaded(observed, kwargs["tags"])
+                        restored.append((key, workers, entry))
+                        if entry["weights_ready"] and _RESIDENT_TAGS.issubset(entry["tags"]):
+                            ray.get(workers[0].continue_generation.remote(), timeout=_ENGINE_OPERATION_TIMEOUT_S)
+                            entry["admission"] = True
+                            observation._refresh_state(entry)
+                except Exception as exc:
+                    observation.failed(observed)
+                    errors.append(exc)
+            if errors:
+                if method == "resume_memory_occupation":
+                    for key, workers, entry in restored:
+                        observed = observation.begin({key: workers}, "DRAINING")
+                        try:
+                            ray.get(workers[0].release_memory_occupation.remote(), timeout=_ENGINE_OPERATION_TIMEOUT_S)
+                            observation.offloaded(
+                                observed,
+                                preserve_weights=getattr(self.args, "_inference_preserve_rollout_weights", False),
+                            )
+                        except Exception:
+                            observation.failed(observed)
+                self.status = "failed"
+                raise errors[0]
+            if method == "release_memory_occupation":
+                self.status = "offload"
+            elif tags is None:
+                self.status = "onload"
+
+    def recover_rollout(self, model_name: str | None = None) -> None:
+        with self._lifecycle_lock:
+            server = (
+                self.servers.get(model_name) if model_name is not None else next(iter(self.servers.values()), None)
+            )
+            if server is None:
+                return
+            observation = self._inference_observation
+            before = observation.begin(self.rollout_replicas(server.model_name), "ONLOADING")
+            try:
+                server.recover()
+            except Exception:
+                observation.failed(before)
+                raise
+            for key, workers in self.rollout_replicas(server.model_name).items():
+                entry = observation.observe(key, workers)
+                if key not in before or entry is not before[key]:
+                    entry["tags"] = {"weights"} if self.args.offload_rollout else set(_RESIDENT_TAGS)
+                entry.update(weights_ready=False, admission=False, initial_weight_probe=False)
+                observation._refresh_state(entry)
+
+    def shutdown_rollout(self, timeout: float = _ENGINE_SHUTDOWN_TIMEOUT_S) -> None:
+        with self._lifecycle_lock:
+            errors, owned_pgs = [], []
+            seen = set()
+            refs = []
+            for server in self.servers.values():
+                for group in server.engine_groups:
+                    if getattr(group, "pg_owned", False) and group.pg is not None and group.pg[0] not in owned_pgs:
+                        owned_pgs.append(group.pg[0])
+                    for index, engine in enumerate(group.all_engines):
+                        if engine is None or id(engine) in seen:
+                            continue
+                        seen.add(id(engine))
+                        try:
+                            refs.append((group, index, engine, engine.shutdown.remote()))
+                        except Exception as exc:
+                            if _is_actor_confirmed_dead(exc):
+                                refs.append((group, index, engine, None))
+                                continue
+                            errors.append(exc)
+            for group, index, engine, ref in refs:
+                try:
+                    if ref is not None:
+                        try:
+                            ray.get(ref, timeout=timeout)
+                        except Exception as exc:
+                            if not _is_actor_confirmed_dead(exc):
+                                raise
+                    ray.kill(engine)
+                    group.all_engines[index] = None
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                self.status = "failed"
+                raise InferenceCleanupError("Rollout shutdown remains unconfirmed") from errors[0]
+
+            for pg in owned_pgs:
+                remove_placement_group(pg)
+            self._inference_observation.registry.invalidate()
+            self.servers.clear()
+            self.status = "offload"
+
     @property
     def engines(self) -> list[Any]:
         return self.all_engines[:: self.nodes_per_engine]
@@ -427,12 +662,8 @@ class InferenceManager:
         return healthy
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
-        """Load engine weights to GPU.
-
-        Also the recovery point for engines that died since the last step: a
-        freshly built engine comes up onloaded, which is exactly the state this
-        phase wants.
-        """
+        if getattr(self, "_inference_role", None) == "rollout":
+            return self._rollout_memory("resume_memory_occupation", tags)
         requested = set(_RESIDENT_TAGS if tags is None else tags)
         if not requested.issubset(_RESIDENT_TAGS):
             raise ValueError(f"Unknown inference memory tags: {sorted(requested - _RESIDENT_TAGS)}")
@@ -490,12 +721,8 @@ class InferenceManager:
             logger.info(f"{self._log_prefix} engines onload completed")
 
     def offload(self) -> None:
-        """Offload engine weights from GPU to free memory.
-
-        Dead engines are retired here but NOT rebuilt: this typically runs
-        while other ranks wait on a barrier, so keep it short and leave the
-        rebuild to the next onload().
-        """
+        if getattr(self, "_inference_role", None) == "rollout":
+            return self._rollout_memory("release_memory_occupation")
         with self._lifecycle_lock:
             if self._cleanup_pending:
                 self._cleanup_slots(list(self._cleanup_pending))
