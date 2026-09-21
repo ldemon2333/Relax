@@ -52,7 +52,16 @@ class GenRMManager(MultiEngineManager):
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
         self._inference_role = "genrm"
-        self._inference_model_id = "__default__"
+        self._inference_model_id = getattr(args, "_inference_model_id", "__default__")
+        self._planned_placement = None
+        if getattr(args, "_inference_placement_plan", None) is not None:
+            from relax.core.service import get_placement_group_topology
+            from relax.inference.placement import model_placement, validate_bound_placement
+
+            self._planned_placement = model_placement(args, "genrm", self._inference_model_id)
+            if self._planned_placement is None:
+                raise ValueError("GenRM model missing from validated placement plan")
+            validate_bound_placement(self._planned_placement, get_placement_group_topology(pg), bundle_indices=pg[1])
         self._engine_spec = InferenceEngineSpec("genrm")
         self._genrm_args, self._engine_overrides = build_static_engine_config(args, "genrm")
         self._inference_served_model_name = (
@@ -108,6 +117,8 @@ class GenRMManager(MultiEngineManager):
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank):
+        if getattr(self, "_planned_placement", None) is not None:
+            return self.pg, False, self._planned_placement.bundle_start + rank * self.num_gpu_per_engine
         gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
         shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
         if not self.args.fully_async and not shared_with_rollout:

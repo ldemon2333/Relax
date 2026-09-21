@@ -4894,6 +4894,14 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     Note: ``init_http_client`` should be called separately before this,
     as the HTTP client is shared across all servers.
     """
+    if getattr(args, "_inference_placement_plan", None) is not None:
+        from relax.core.service import get_placement_group_topology
+        from relax.inference.placement import validate_bound_placement
+
+        topology = get_placement_group_topology(pg)
+        for placement in args._inference_placement_plan["placements"]:
+            if placement["role"] == "rollout":
+                validate_bound_placement(placement, topology, bundle_indices=pg[1])
     config = _resolve_sglang_config(args)
 
     servers: dict[str, RolloutServer] = {}

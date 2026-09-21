@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 import ray
 import transfer_queue as tq
+import yaml
 from omegaconf import OmegaConf
 from ray import serve
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
@@ -28,10 +29,11 @@ from relax.components.inference_gateway import InferenceGateway
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
-from relax.core.service import Service, create_placement_group
+from relax.core.service import Service, create_placement_group, get_placement_group_topology
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
+from relax.inference.placement import plan_inference_placement, validate_bound_placement
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
@@ -769,6 +771,7 @@ class Controller:
 
     def register_all_serve(self):
         validate_ppo_config(self.config)
+        self._preflight_inference_placement()
 
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
@@ -832,6 +835,11 @@ class Controller:
                     num_gpus=num_gpus,
                     node_group_affinity=self.config.enable_affinity,
                 )
+                try:
+                    self._validate_actor_inference_binding(actor_rollout_pgs)
+                except Exception:
+                    ray.util.remove_placement_group(actor_rollout_pgs[0])
+                    raise
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
@@ -857,6 +865,39 @@ class Controller:
             logger.info(f"S3 model prefetch completed on {len(model_prefetch_refs)} consumer nodes")
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
+
+    def _preflight_inference_placement(self) -> None:
+
+        rollout_config = getattr(self.config, "sglang_config", None)
+        if isinstance(rollout_config, (str, os.PathLike)):
+            with open(rollout_config) as config_file:
+                self.config._inference_rollout_config = yaml.safe_load(config_file)
+        else:
+            self.config._inference_rollout_config = rollout_config
+        plan = plan_inference_placement(self.config)
+        if plan.mode == "defer":
+            raise NotImplementedError(
+                "Deferred inference placement requires the P5 serial bootstrap and scoring coordinator; "
+                "use decoupled or split placement until that coordinator is enabled"
+            )
+        accelerator = device_utils.get_ray_accelerator_name()
+        available = int(ray.cluster_resources().get(accelerator, 0))
+        if plan.total_required_gpus > available:
+            raise RuntimeError(
+                f"Insufficient GPU resources: inference placement plan requires {plan.total_required_gpus} "
+                f"GPUs but the cluster has {available}"
+            )
+        self.config._inference_placement_plan = plan.to_dict()
+        logger.info(
+            f"Inference placement preflight succeeded: required={plan.total_required_gpus}, available={available}"
+        )
+
+    def _validate_actor_inference_binding(self, pgs: tuple) -> None:
+
+        topology = get_placement_group_topology(pgs)
+        for placement in self.config._inference_placement_plan["placements"]:
+            if placement["pool"] == "actor":
+                validate_bound_placement(placement, topology, bundle_indices=pgs[1])
 
     def _report_error_to_metrics_service(self, error: Exception):
         """Report error to metrics service for Apprise notification.

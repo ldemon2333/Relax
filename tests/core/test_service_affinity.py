@@ -54,7 +54,8 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         captured["strategy"] = strategy
         return MagicMock(name="pg")
 
-    def _fake_ray_get(arg):
+    def _fake_ray_get(arg, timeout=None):
+        assert timeout is not None and timeout > 0
         # Second call passes a list of get_ip_and_gpu_id futures -> return one
         # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
         if isinstance(arg, list):
@@ -72,6 +73,10 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         patch("relax.core.service.ray.get", side_effect=_fake_ray_get),
         patch("relax.core.service.ray.kill", MagicMock()),
         patch("relax.core.service.ray.cluster_resources", cr_mock),
+        patch(
+            "relax.core.service.ray.nodes",
+            return_value=[{"Alive": True, "NodeID": "node-a", "NodeManagerAddress": "10.0.0.1"}],
+        ),
         patch("relax.core.service.time.sleep"),
     ):
         pg, reordered_indices, reordered_gpu_ids = create_placement_group(

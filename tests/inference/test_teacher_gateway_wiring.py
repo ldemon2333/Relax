@@ -81,7 +81,7 @@ def test_multi_teacher_launcher_records_actual_created_manager_order(opd_utils, 
     code_manager.get_urls.remote.return_value = ["http://code.example/generate"]
     created = {"math": math_manager, "code": code_manager}
     monkeypatch.setattr(multi_instance_orchestrator, "start_multi_instance_managers", lambda **kwargs: created)
-    monkeypatch.setattr(ray, "get", lambda value: value)
+    monkeypatch.setattr(ray, "get", lambda value, timeout=None: value)
     args = SimpleNamespace(
         use_opd=True,
         opd_type="sglang",
