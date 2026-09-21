@@ -17,17 +17,9 @@ from types import SimpleNamespace
 import pytest
 
 
-try:
-    import ray  # noqa: F401
+pytest.importorskip("ray", reason="requires ray", exc_type=ImportError)
 
-    from relax.distributed.ray.multi_engine_manager import MultiEngineManager
-
-    HAS_DEPS = True
-except ImportError:
-    HAS_DEPS = False
-
-
-pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="requires ray")
+from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 
 
 class _RemoteCall:
@@ -57,7 +49,9 @@ class _FakeManager(MultiEngineManager):
     """A minimal concrete manager: one engine per rank, no placement group
     (hooks return sentinel values that the test never inspects)."""
 
-    def __init__(self, num_slots: int, *, owns_pg: bool = False, log_prefix: str = "[fake]"):
+    def __init__(
+        self, num_slots: int, *, owns_pg: bool = False, nodes_per_engine: int = 1, log_prefix: str = "[fake]"
+    ):
         self._made: list[_FakeEngine] = []
         self._dead_at_init: set[int] = set()
         self._removed_pg = False
@@ -65,6 +59,7 @@ class _FakeManager(MultiEngineManager):
         super().__init__(
             SimpleNamespace(),
             num_slots=num_slots,
+            nodes_per_engine=nodes_per_engine,
             engine_actor_cls=_FakeEngineActorCls,
             log_prefix=log_prefix,
         )
@@ -255,3 +250,37 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Legacy onload marks weights-only restore complete and skips the later full restore (Task 3 P3)",
+)
+def test_multi_engine_manager_partial_resume_does_not_skip_full_resume(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    engine.calls.clear()
+
+    manager.offload()
+    manager.onload(tags=["weights"])
+    manager.onload()
+
+    assert engine.calls == [
+        "release_memory_occupation",
+        "resume_memory_occupation",
+        "resume_memory_occupation",
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Legacy shutdown visits only logical heads and leaves follower actors running (Task 3 P3)",
+)
+def test_multi_engine_manager_shutdown_retires_all_multinode_worker_slots(_patch_ray):
+    manager = _FakeManager(num_slots=4, nodes_per_engine=2)
+    original_engines = list(manager.all_engines)
+
+    manager.shutdown()
+
+    assert set(_patch_ray.killed) == set(original_engines)
+    assert manager.all_engines == [None, None, None, None]

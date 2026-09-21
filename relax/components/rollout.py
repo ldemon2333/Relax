@@ -819,7 +819,15 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
+    async def get_engines(self, model_name: Optional[str] = None, schema: int = 1):
+        if schema == 2:
+            result = await self.rollout_manager.get_inference_snapshot.remote()
+            if model_name is not None:
+                if model_name not in result["models"]:
+                    raise HTTPException(status_code=404, detail="Unknown inference model")
+            return result
+        if schema != 1:
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema")
         result = await self.rollout_manager.get_engines_info.remote(model_name)
         return result
 

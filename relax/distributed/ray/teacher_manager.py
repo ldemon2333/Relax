@@ -88,6 +88,10 @@ class TeacherManager(MultiEngineManager):
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
         self._overrides = overrides
         self._teacher_args = build_teacher_engine_args(args, overrides)
+        self._inference_role = "teacher"
+        self._inference_model_id = "__default__"
+        self._inference_served_model_name = overrides.get("served_model_name") or overrides.get("model_path")
+        self._inference_preserves_weights = overrides.get("enable_weights_cpu_backup") is True
         logger.info(
             f"[OPD teacher] launching {num_replicas} replica(s), "
             f"TP={gpus_per_replica}, model={overrides['model_path']}, "

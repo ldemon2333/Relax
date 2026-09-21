@@ -50,6 +50,14 @@ class GenRMManager(MultiEngineManager):
         self.num_gpu_per_engine = num_gpu_per_engine
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
+        self._inference_role = "genrm"
+        self._inference_model_id = "__default__"
+        self._inference_served_model_name = (args.genrm_engine_config or {}).get("served_model_name") or (
+            args.genrm_engine_config or {}
+        ).get("model_path", args.genrm_model_path)
+        self._inference_preserves_weights = (args.genrm_engine_config or {}).get(
+            "enable_weights_cpu_backup", True
+        ) is True
 
         super().__init__(
             args,

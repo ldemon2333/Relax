@@ -19,13 +19,14 @@ from typing import Any, List, Optional, Union
 
 import httpx
 import ray
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.inference.compat import RoleDiscovery
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -214,6 +215,14 @@ class GenRM(Base):
                 f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
             )
         return key
+
+    @app.get("/engines")
+    async def get_engines(self, schema: int = 2) -> dict:
+        if schema != 2:
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema")
+        if not hasattr(self, "_inference_discovery"):
+            self._inference_discovery = RoleDiscovery("genrm", lambda: self.genrm_managers)
+        return await self._inference_discovery.snapshot()
 
     def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
         """Round-robin one live engine of the instance selected by

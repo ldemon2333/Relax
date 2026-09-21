@@ -16,6 +16,7 @@ creates and tears down itself (e.g. a non-colocated OPD teacher). Subclasses
 express this via ``_resolve_placement``.
 """
 
+import threading
 from typing import Any, Optional
 
 import ray
@@ -54,6 +55,130 @@ _ENGINE_DEAD_EXCEPTIONS = (
 # to "run with N-1 engines" instead of hanging the training step forever.
 _ENGINE_REBUILD_TIMEOUT_S = 900.0
 _ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
+_DISCOVERY_TIMEOUT_S = 5.0
+_RESIDENT_TAGS = frozenset({"weights", "kv_cache", "cuda_graph"})
+
+
+class _InferenceObservation:
+    """Read-only discovery evidence, separate from legacy lifecycle flags.
+
+    Lifecycle owners acknowledge successful operations here; this helper does
+    not launch, stop, recover, or wake an engine. Unknown evidence fails
+    closed.
+    """
+
+    def __init__(self, role: str) -> None:
+        from relax.inference.registry import InferenceRegistry
+
+        self.lock = threading.RLock()
+        self.registry = InferenceRegistry(role)
+        self.entries: dict[str, dict[str, Any]] = {}
+
+    def observe(self, key: str, workers: list[Any]) -> dict[str, Any]:
+        identity = tuple(id(worker) if worker is not None else None for worker in workers)
+        previous = self.entries.get(key)
+        if previous is None or previous["identity"] != identity:
+            self.registry.invalidate()
+            self.entries[key] = {
+                "identity": identity,
+                "workers": tuple(workers),
+                "generation": 1 if previous is None else previous["generation"] + 1,
+                "state": "STARTING",
+                "tags": set(),
+                "weights_ready": False,
+                "admission": False,
+            }
+        return self.entries[key]
+
+    def initialized(self, key: str, workers: list[Any], *, weights_ready: bool) -> None:
+        with self.lock:
+            entry = self.observe(key, workers)
+            entry.update(tags=set(_RESIDENT_TAGS), weights_ready=weights_ready, admission=True)
+            self._refresh_state(entry)
+            self.registry.invalidate()
+
+    @staticmethod
+    def _refresh_state(entry: dict[str, Any]) -> None:
+        entry["state"] = (
+            "READY"
+            if _RESIDENT_TAGS.issubset(entry["tags"]) and entry["weights_ready"] and entry["admission"]
+            else "ONLOADING"
+        )
+
+    def begin(self, replicas: dict[str, list[Any]], state: str) -> dict[str, dict[str, Any]]:
+        with self.lock:
+            entries = {key: self.observe(key, workers) for key, workers in replicas.items()}
+            for entry in entries.values():
+                entry["state"] = state
+                entry["admission"] = False
+            if entries:
+                self.registry.invalidate()
+            return entries
+
+    def failed(self, entries: dict[str, dict[str, Any]]) -> None:
+        with self.lock:
+            for entry in entries.values():
+                entry.update(state="FAILED", admission=False)
+
+    def offloaded(self, entries: dict[str, dict[str, Any]], *, preserve_weights: bool) -> None:
+        with self.lock:
+            for entry in entries.values():
+                entry.update(
+                    state="SLEEPING",
+                    tags=set(),
+                    admission=False,
+                    weights_ready=entry["weights_ready"] and preserve_weights,
+                )
+
+    def onloaded(self, entries: dict[str, dict[str, Any]], tags: Optional[list[str]]) -> None:
+        with self.lock:
+            for entry in entries.values():
+                entry["tags"].update(_RESIDENT_TAGS if tags is None else tags)
+                if tags is None:
+                    entry["admission"] = True
+                self._refresh_state(entry)
+
+    def replica(self, key: str, workers: list[Any], *, direct: bool, expected_workers: int) -> dict[str, Any]:
+        """Probe a complete logical replica; never publish follower
+        addresses."""
+        entry = self.observe(key, workers)
+        state = entry["state"]
+        base_url = None
+        if len(workers) != expected_workers or any(worker is None for worker in workers):
+            state = "FAILED"
+        elif state == "READY":
+            try:
+                refs = [worker.health_process.remote() for worker in workers]
+                refs.extend([workers[0].health_generate.remote(), workers[0].get_url.remote()])
+                results = ray.get(refs, timeout=_DISCOVERY_TIMEOUT_S)
+                if any(result is not True for result in results[:-1]):
+                    state = "FAILED" if False in results[:-1] else "STARTING"
+                else:
+                    base_url = results[-1]
+                    if not base_url:
+                        state = "STARTING"
+                    elif entry.get("endpoint") != base_url:
+                        if entry.get("endpoint") is not None:
+                            entry["generation"] += 1
+                        entry["endpoint"] = base_url
+            except Exception:
+                state = "FAILED"
+        return {
+            "engine_id": key,
+            "generation": entry["generation"],
+            "base_url": base_url,
+            "state": state,
+            "direct_eligible": direct and state == "READY",
+        }
+
+
+def _model_discovery_state(replicas: list[dict[str, Any]]) -> str:
+    states = {replica["state"] for replica in replicas}
+    if "READY" in states:
+        return "READY"
+    if len(states) == 1:
+        return next(iter(states))
+    return "STARTING"
 
 
 def _is_engine_dead(exc: BaseException) -> bool:
@@ -99,6 +224,7 @@ class MultiEngineManager:
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
+        self._inference_observation = _InferenceObservation(getattr(self, "_inference_role", "genrm"))
 
         if not skip_init:
             self._init_engines(list(range(num_slots)))
@@ -107,6 +233,40 @@ class MultiEngineManager:
     def engines(self) -> list[Any]:
         """Return the head-node slot of each logical engine."""
         return self.all_engines[:: self.nodes_per_engine]
+
+    def _inference_replicas(self) -> dict[str, list[Any]]:
+        model_id = getattr(self, "_inference_model_id", "__default__")
+        return {
+            f"{model_id}/replica-{rank // self.nodes_per_engine}": self.all_engines[
+                rank : rank + self.nodes_per_engine
+            ]
+            for rank in range(0, len(self.all_engines), self.nodes_per_engine)
+        }
+
+    def get_inference_snapshot(self) -> dict[str, Any]:
+        """Versioned logical-replica discovery; legacy URL methods are
+        unchanged."""
+        from relax.inference.specs import RoutingSpec
+
+        observation = self._inference_observation
+        model_id = getattr(self, "_inference_model_id", "__default__")
+        with observation.lock:
+            replicas = [
+                observation.replica(key, workers, direct=True, expected_workers=self.nodes_per_engine)
+                for key, workers in self._inference_replicas().items()
+            ]
+            model = {
+                "model_id": model_id,
+                "state": _model_discovery_state(replicas),
+                "weight_source": "STATIC",
+                "weight_version": None,
+                "served_model_name": getattr(self, "_inference_served_model_name", None),
+                "route_mode": "DIRECT",
+                "router_url": None,
+                "engines": replicas,
+                "capabilities": ["generate", "chat"],
+            }
+            return observation.registry.publish({model_id: model}, routing=RoutingSpec(default_model=model_id))
 
     # ------------------------------------------------------------------
     # Hooks -- subclasses must implement these.
@@ -227,6 +387,11 @@ class MultiEngineManager:
                 self._remove_owned_pg(rank)
             raise
 
+        new_ranks = {rank for rank, _engine in new_engines}
+        for index, (key, workers) in enumerate(self._inference_replicas().items()):
+            replica_ranks = set(range(index * self.nodes_per_engine, (index + 1) * self.nodes_per_engine))
+            if len(workers) == self.nodes_per_engine and replica_ranks.issubset(new_ranks):
+                self._inference_observation.initialized(key, workers, weights_ready=True)
         return num_new_engines
 
     def _remove_owned_pg(self, rank: int) -> None:
@@ -275,7 +440,18 @@ class MultiEngineManager:
         logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
         # Engines rebuilt just above are already onloaded -- resuming them
         # again would be a double-resume, so only touch the ones that survived.
-        dead = self._fanout("resume_memory_occupation", skip_ranks=rebuilt, tags=tags)
+        replicas = {
+            key: workers
+            for index, (key, workers) in enumerate(self._inference_replicas().items())
+            if index * self.nodes_per_engine not in rebuilt
+        }
+        observed = self._inference_observation.begin(replicas, "ONLOADING")
+        try:
+            dead = self._fanout("resume_memory_occupation", skip_ranks=rebuilt, tags=tags)
+        except Exception:
+            self._inference_observation.failed(observed)
+            raise
+        self._inference_observation.onloaded(observed, tags)
         if dead:
             # An engine that died while offloaded is only discovered here
             # (offload() short-circuits when already offloaded), so it missed
@@ -297,8 +473,16 @@ class MultiEngineManager:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
         logger.info(f"{self._log_prefix} engines offload started")
-        dead = self._fanout("release_memory_occupation")
+        observed = self._inference_observation.begin(self._inference_replicas(), "DRAINING")
+        try:
+            dead = self._fanout("release_memory_occupation")
+        except Exception:
+            self._inference_observation.failed(observed)
+            raise
         self._retire_engines(dead)
+        self._inference_observation.offloaded(
+            observed, preserve_weights=getattr(self, "_inference_preserves_weights", False)
+        )
         # Unconditional: the surviving engines did release, so the manager
         # must not claim to still be onloaded just because one engine died.
         self._onloaded = False

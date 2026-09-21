@@ -815,6 +815,10 @@ class SGLangEngine(RayActor):
             except Exception:
                 pass
 
+    def health_process(self) -> bool | None:
+        process = getattr(self, "process", None)
+        return bool(process.is_alive()) if process is not None else None
+
     def get_url(self) -> str | None:
         """Return the HTTP URL of this engine, or None for non-node-0
         engines."""

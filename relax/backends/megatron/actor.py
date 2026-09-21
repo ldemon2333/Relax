@@ -2467,9 +2467,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with self._train_state_offloader.disable_during_update():
+            if dist.get_rank(get_gloo_group()) == 0:
+                ray.get(self.rollout_manager.mark_inference_weights_updating.remote())
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
+            if dist.get_rank(get_gloo_group()) == 0:
+                ray.get(self.rollout_manager.mark_inference_weights_ready.remote())
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -2661,7 +2665,13 @@ class MegatronTrainRayActor(TrainRayActor):
         try:
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
+            rollout_manager = getattr(self, "rollout_manager", None)
+            if not actor_fwd_only and rollout_manager is not None and dist.get_rank(get_gloo_group()) == 0:
+                ray.get(rollout_manager.mark_inference_weights_updating.remote())
             run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            if not actor_fwd_only and dist.get_rank(get_gloo_group()) == 0:
+                if rollout_manager is not None:
+                    ray.get(rollout_manager.mark_inference_weights_ready.remote())
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())

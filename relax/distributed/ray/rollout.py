@@ -23,6 +23,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.multi_engine_manager import _InferenceObservation, _model_discovery_state
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
@@ -889,6 +890,7 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self._inference_observation = _InferenceObservation("rollout")
         self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
@@ -921,6 +923,10 @@ class RolloutManager(ReloadableMixin):
         else:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg)
+        for key, workers in self._inference_replicas().items():
+            if workers and all(worker is not None for worker in workers):
+                self._inference_observation.initialized(key, workers, weights_ready=False)
+                self._inference_observation.entries[key]["initial_weight_probe"] = True
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
@@ -1261,8 +1267,17 @@ class RolloutManager(ReloadableMixin):
             logger.info("Rollout already offloaded; skipping")
             return
         self.health_monitoring_pause()
-        for srv in self.servers.values():
-            srv.offload()
+        observation = self._get_inference_observation()
+        observed = observation.begin(self._inference_replicas(), "DRAINING")
+        try:
+            for srv in self.servers.values():
+                srv.offload()
+        except Exception:
+            observation.failed(observed)
+            raise
+        observation.offloaded(observed, preserve_weights=False)
+        for entry in observed.values():
+            entry["initial_weight_probe"] = False
         self.status = "offload"
 
     async def onload(self, tags: list[str] | None = None):
@@ -1271,8 +1286,15 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
-        for srv in self.servers.values():
-            srv.onload(tags)
+        observation = self._get_inference_observation()
+        observed = observation.begin(self._inference_replicas(), "ONLOADING")
+        try:
+            for srv in self.servers.values():
+                srv.onload(tags)
+        except Exception:
+            observation.failed(observed)
+            raise
+        observation.onloaded(observed, tags)
         # Full onload transitions status; per-tag calls leave status for the
         # dedicated wrappers below (onload_weights / onload_kv).
         if tags is None:
@@ -1283,6 +1305,12 @@ class RolloutManager(ReloadableMixin):
 
     async def onload_kv(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
+        observation = self._get_inference_observation()
+        with observation.lock:
+            for key, workers in self._inference_replicas().items():
+                entry = observation.observe(key, workers)
+                entry["admission"] = entry["weights_ready"]
+                observation._refresh_state(entry)
         self.status = "onload"
 
     def get_status(self):
@@ -1300,7 +1328,24 @@ class RolloutManager(ReloadableMixin):
             gpu_offsets = srv.engine_gpu_offsets if srv else []
             return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
 
-        srv.recover()
+        observation = self._get_inference_observation()
+        observed = observation.begin(self._inference_replicas(srv.model_name), "ONLOADING")
+        try:
+            srv.recover()
+        except Exception:
+            observation.failed(observed)
+            raise
+        with observation.lock:
+            for key, workers in self._inference_replicas(srv.model_name).items():
+                entry = observation.observe(key, workers)
+                if entry is not observed[key]:
+                    entry["tags"] = (
+                        {GPU_MEMORY_TYPE_WEIGHTS}
+                        if self.args.offload_rollout
+                        else {GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH}
+                    )
+                entry.update(weights_ready=False, admission=False, initial_weight_probe=False)
+                observation._refresh_state(entry)
         return (
             srv.engines,
             self.rollout_engine_lock,
@@ -2365,6 +2410,24 @@ class RolloutManager(ReloadableMixin):
         # Step 6: Add to server
         srv.engine_groups.append(engine_group)
         engine_group.num_new_engines = 0
+        observation = self._get_inference_observation()
+        admitted = getattr(self, "_inference_admitted_engines", set())
+        for head in range(0, len(engine_group.all_engines), engine_group.nodes_per_engine):
+            workers = engine_group.all_engines[head : head + engine_group.nodes_per_engine]
+            key = f"{srv.model_name}/group-{engine_group.rank_offset}/replica-{head // engine_group.nodes_per_engine}"
+            observation.initialized(key, workers, weights_ready=False)
+            if workers and id(workers[0]) in admitted:
+                try:
+                    version = await asyncio.wait_for(workers[0].get_weight_version.remote(), timeout=5.0)
+                except Exception:
+                    version = None
+                if version is not None and str(version) not in {"", "default"}:
+                    with observation.lock:
+                        entry = observation.observe(key, workers)
+                        entry.update(weights_ready=True, weight_version=str(version))
+                        observation._refresh_state(entry)
+            for worker in workers:
+                admitted.discard(id(worker))
 
         # Step 7: Register health monitor
         if self.args.use_fault_tolerance:
@@ -3135,7 +3198,17 @@ class RolloutManager(ReloadableMixin):
                         resume_refs.append(engine.continue_generation.remote())
                 if resume_refs:
                     try:
-                        await asyncio.wait_for(asyncio.gather(*resume_refs, return_exceptions=True), timeout=30)
+                        resume_results = await asyncio.wait_for(
+                            asyncio.gather(*resume_refs, return_exceptions=True), timeout=30
+                        )
+                        admitted = getattr(self, "_inference_admitted_engines", None)
+                        if admitted is None:
+                            admitted = self._inference_admitted_engines = set()
+                        for engine, result in zip(
+                            [engine for engine in new_engines if engine is not None], resume_results, strict=True
+                        ):
+                            if not isinstance(result, BaseException):
+                                admitted.add(id(engine))
                     except Exception as e:
                         logger.warning(f"[ScaleOut][WeightSync] Some continue_generation calls failed: {e}")
             else:
@@ -3256,6 +3329,141 @@ class RolloutManager(ReloadableMixin):
         if srv is None:
             return {"router_ip": None, "router_port": None}
         return {"router_ip": srv.router_ip, "router_port": srv.router_port}
+
+    def _get_inference_observation(self) -> _InferenceObservation:
+        observation = getattr(self, "_inference_observation", None)
+        if observation is None:
+            observation = self._inference_observation = _InferenceObservation("rollout")
+        return observation
+
+    def _inference_replicas(self, model_name: Optional[str] = None) -> dict[str, list[Any]]:
+        replicas = {}
+        for name, server in self.servers.items():
+            if model_name is not None and name != model_name:
+                continue
+            for group in server.engine_groups:
+                for head in range(0, len(group.all_engines), group.nodes_per_engine):
+                    key = f"{name}/group-{group.rank_offset}/replica-{head // group.nodes_per_engine}"
+                    replicas[key] = group.all_engines[head : head + group.nodes_per_engine]
+        return replicas
+
+    def mark_inference_weights_ready(self, model_name: Optional[str] = None) -> None:
+        server = self._get_server(model_name)
+        if server is None:
+            return
+        observation = self._get_inference_observation()
+        with observation.lock:
+            for key, workers in self._inference_replicas(server.model_name).items():
+                entry = observation.observe(key, workers)
+                if not workers or any(worker is None for worker in workers):
+                    continue
+                try:
+                    version = ray.get(workers[0].get_weight_version.remote(), timeout=5.0)
+                except Exception:
+                    entry.update(state="FAILED", admission=False)
+                    continue
+                if version is None or str(version) in {"", "default"}:
+                    continue
+                entry.update(
+                    weights_ready=True, admission=True, weight_version=str(version), initial_weight_probe=False
+                )
+                observation._refresh_state(entry)
+            observation.registry.invalidate()
+
+    def mark_inference_weights_updating(self, model_name: Optional[str] = None) -> None:
+        server = self._get_server(model_name)
+        if server is None:
+            return
+        observation = self._get_inference_observation()
+        entries = observation.begin(self._inference_replicas(server.model_name), "ONLOADING")
+        with observation.lock:
+            for entry in entries.values():
+                entry.update(weights_ready=False, admission=False, initial_weight_probe=False)
+
+    @ray.method(concurrency_group="scale_out")
+    def get_inference_snapshot(self) -> dict[str, Any]:
+        """Publish logical ingress discovery without changing legacy
+        diagnostics."""
+        from relax.inference.specs import RoutingSpec
+
+        observation = self._get_inference_observation()
+        with self._engine_lifecycle_lock, observation.lock:
+            models = {}
+            for name, server in self.servers.items():
+                replicas = []
+                versions = set()
+                served_model_names = set()
+                required_kinds: dict[str, list[dict[str, Any]]] = {}
+                for group in server.engine_groups:
+                    if group.worker_type == "placeholder":
+                        continue
+                    overrides = group.sglang_overrides
+                    served_model_names.add(
+                        overrides.get("served_model_name")
+                        or overrides.get("model_path")
+                        or getattr(self.args, "sglang_served_model_name", None)
+                        or getattr(self.args, "hf_checkpoint", None)
+                    )
+                    group_replicas = []
+                    for head in range(0, len(group.all_engines), group.nodes_per_engine):
+                        key = f"{name}/group-{group.rank_offset}/replica-{head // group.nodes_per_engine}"
+                        workers = group.all_engines[head : head + group.nodes_per_engine]
+                        entry = observation.observe(key, workers)
+                        if entry.get("initial_weight_probe") and workers and workers[0] is not None:
+                            try:
+                                version = ray.get(workers[0].get_weight_version.remote(), timeout=5.0)
+                            except Exception:
+                                version = None
+                            if version is not None and str(version) not in {"", "default"}:
+                                entry.update(
+                                    weights_ready=True, weight_version=str(version), initial_weight_probe=False
+                                )
+                                observation._refresh_state(entry)
+                        replica = observation.replica(
+                            key, workers, direct=False, expected_workers=group.nodes_per_engine
+                        )
+                        if group.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
+                            replica.update(state="DRAINING", base_url=None, direct_eligible=False)
+                        if self._training_weight_updating or self._scale_out_weight_updating:
+                            replica.update(state="ONLOADING", base_url=None, direct_eligible=False)
+                        if replica["state"] == "READY" and entry.get("weight_version") is not None:
+                            versions.add(entry["weight_version"])
+                        group_replicas.append(replica)
+                    required_kinds.setdefault(group.worker_type, []).extend(group_replicas)
+                    if group.worker_type == "regular":
+                        replicas.extend(group_replicas)
+                all_replicas = [replica for group in required_kinds.values() for replica in group]
+                state = _model_discovery_state(all_replicas)
+                has_pd = "prefill" in required_kinds or "decode" in required_kinds
+                if has_pd:
+                    replicas = []
+                    if not all(
+                        any(replica["state"] == "READY" for replica in required_kinds.get(kind, []))
+                        for kind in ("prefill", "decode")
+                    ):
+                        state = "STARTING" if state == "READY" else state
+                router_url = (
+                    f"http://{_wrap_ipv6(server.router_ip)}:{server.router_port}"
+                    if server.router_ip and server.router_port
+                    else None
+                )
+                if state == "READY" and router_url is None:
+                    state = "STARTING"
+                models[name] = {
+                    "model_id": name,
+                    "state": state,
+                    "weight_source": "DCS"
+                    if self.args.fully_async and not getattr(self.args, "hybrid", False)
+                    else "ACTOR",
+                    "weight_version": next(iter(versions)) if len(versions) == 1 else None,
+                    "served_model_name": next(iter(served_model_names)) if len(served_model_names) == 1 else None,
+                    "route_mode": "SGLANG_ROUTER",
+                    "router_url": router_url,
+                    "engines": replicas,
+                    "capabilities": ["generate", "chat"],
+                }
+            default_model = next(iter(models)) if len(models) == 1 else None
+            return observation.registry.publish(models, routing=RoutingSpec(default_model=default_model))
 
     @ray.method(concurrency_group="scale_out")
     def get_engines_info(self, model_name: Optional[str] = None) -> dict:
@@ -3520,6 +3728,7 @@ class RolloutManager(ReloadableMixin):
             ):
                 return False
             self._training_weight_updating = is_updating
+            self._get_inference_observation().registry.invalidate()
             return True
 
     @ray.method(concurrency_group="scale_in")
