@@ -190,6 +190,8 @@ def test_legacy_genrm_drain_explicitly_retains_best_effort_pause():
 
 
 def test_actual_sglang_static_engine_guards_and_partial_resume(monkeypatch):
+    pytest.importorskip("sglang")
+
     from relax.backends.sglang.sglang_engine import SGLangEngine
 
     engine = SGLangEngine.__new__(SGLangEngine)
@@ -219,6 +221,8 @@ def test_actual_sglang_static_engine_guards_and_partial_resume(monkeypatch):
 
 
 def test_actual_sglang_launch_keeps_follower_process_and_rolls_back_failed_head(monkeypatch):
+    pytest.importorskip("sglang")
+
     from relax.backends.sglang import sglang_engine as module
 
     alive = [True]
@@ -245,6 +249,8 @@ def test_actual_sglang_launch_keeps_follower_process_and_rolls_back_failed_head(
 
 
 def test_actual_sglang_preinit_shutdown_acknowledges_empty_ownership():
+    pytest.importorskip("sglang")
+
     from relax.backends.sglang.sglang_engine import SGLangEngine
 
     engine = SGLangEngine.__new__(SGLangEngine)
@@ -253,6 +259,8 @@ def test_actual_sglang_preinit_shutdown_acknowledges_empty_ownership():
 
 
 def test_actual_sglang_shutdown_does_not_acknowledge_live_process(monkeypatch):
+    pytest.importorskip("sglang")
+
     from relax.backends.sglang import sglang_engine as module
 
     engine = module.SGLangEngine.__new__(module.SGLangEngine)

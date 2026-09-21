@@ -18,6 +18,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.inference.compat import public_legacy_discovery
 from relax.inference.gateway import InferenceGatewayHandler
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
@@ -824,7 +825,7 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None, schema: int = 1):
+    async def get_engines(self, model_name: Optional[str] = None, schema: int = 2):
         if schema == 2:
             result = await self.rollout_manager.get_inference_snapshot.remote()
             if model_name is not None:
@@ -834,7 +835,8 @@ class Rollout(Base):
         if schema != 1:
             raise HTTPException(status_code=400, detail="Unsupported discovery schema")
         result = await self.rollout_manager.get_engines_info.remote(model_name)
-        return result
+
+        return public_legacy_discovery(result)
 
     @app.post("/scale_in", response_model=ScaleInResponse)
     async def scale_in(self, request: ScaleInAPIRequest):

@@ -3,7 +3,7 @@
 """GenRM Manager for Generative Reward Model Service.
 
 This module implements a simplified manager for genRM engines, built on top of
-``MultiEngineManager`` (parallel bring-up, health check, dead-engine recovery,
+``InferenceManager`` (parallel bring-up, health check, dead-engine recovery,
 onload/offload) with GenRM-specific placement and engine wiring.
 """
 
@@ -13,9 +13,11 @@ import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
+from relax.core.service import get_placement_group_topology
+from relax.distributed.ray.inference_manager import InferenceManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
+from relax.inference.placement import model_placement, validate_bound_placement
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -31,7 +33,7 @@ _MAX_PORT = 65535
 
 
 @ray.remote
-class GenRMManager(MultiEngineManager):
+class GenRMManager(InferenceManager):
     """Manager for GenRM engines.
 
     This is a simplified version of RolloutManager focused on:
@@ -55,9 +57,6 @@ class GenRMManager(MultiEngineManager):
         self._inference_model_id = getattr(args, "_inference_model_id", "__default__")
         self._planned_placement = None
         if getattr(args, "_inference_placement_plan", None) is not None:
-            from relax.core.service import get_placement_group_topology
-            from relax.inference.placement import model_placement, validate_bound_placement
-
             self._planned_placement = model_placement(args, "genrm", self._inference_model_id)
             if self._planned_placement is None:
                 raise ValueError("GenRM model missing from validated placement plan")
@@ -113,7 +112,6 @@ class GenRMManager(MultiEngineManager):
         return results
 
     # ------------------------------------------------------------------
-    # MultiEngineManager hooks.
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank):

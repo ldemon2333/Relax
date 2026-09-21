@@ -25,6 +25,7 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.inference.client import generate_with_discovery
 from relax.inference.defer import register_deferred_rollout_finalize
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -394,7 +395,20 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
+    discovery_url = getattr(args, "_inference_rollout_discovery_url", None)
+    if discovery_url:
+        output = await generate_with_discovery(
+            discovery_url,
+            payload,
+            model=getattr(args, "_inference_rollout_model", None),
+            headers=headers,
+            timeout=args.rollout_http_timeout,
+            max_connections=(
+                args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+            ),
+        )
+    else:
+        output = await post(url, payload, headers=headers)
     _t_generate = monotonic() - _t_generate_start
 
     _t_post_generate_start = monotonic()

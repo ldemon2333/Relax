@@ -67,6 +67,8 @@ def test_disabled_teacher_clears_restart_identity_metadata(opd_utils):
 
 
 def test_multi_teacher_launcher_records_actual_created_manager_order(opd_utils, monkeypatch):
+    pytest.importorskip("sglang")
+
     import ray
 
     from relax.core import service
@@ -204,6 +206,8 @@ def test_teacher_gateway_failed_delete_retains_ownership_for_retry(teacher_contr
 
 
 def test_controller_shutdown_removes_gateway_before_teacher_engines(teacher_controller, monkeypatch):
+    pytest.importorskip("sglang")
+
     instance, _gateway, _run, delete, teacher = teacher_controller
     module = instance._test_module
     events = []

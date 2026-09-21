@@ -1594,16 +1594,6 @@ class SGLangEngine(RayActor):
             run(self.checkpoint_engine_client.unregister())
 
 
-class GenRMEngine(SGLangEngine):
-    """Compatibility constructor; managed roles use SGLangEngine directly."""
-
-    engine_spec = InferenceEngineSpec("genrm", strict_drain=False)
-
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault("engine_spec", InferenceEngineSpec("genrm", strict_drain=False))
-        super().__init__(*args, **kwargs)
-
-
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
     if getattr(args, "enable_mtp_training", False):
         return False
@@ -1837,7 +1827,7 @@ def _compute_server_args(
             unused_keys.discard(key)
 
     if getattr(args, "_inference_preserve_rollout_weights", False):
-        if kwargs.get("enable_weights_cpu_backup") is False:
+        if sglang_overrides is not None and sglang_overrides.get("enable_weights_cpu_backup") is False:
             raise ValueError("Deferred rollout requires CPU weight backup for same-version restoration")
         kwargs["enable_weights_cpu_backup"] = True
 

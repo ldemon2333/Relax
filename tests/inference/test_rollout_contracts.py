@@ -9,6 +9,8 @@ import pytest
 
 @pytest.fixture
 def legacy_rollout(monkeypatch):
+    pytest.importorskip("sglang")
+
     from relax.distributed.ray import rollout
 
     engines = [MagicMock() for _ in range(4)]

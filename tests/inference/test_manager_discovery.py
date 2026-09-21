@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Legacy-manager discovery evidence, exercised with fake engine RPCs."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -10,10 +9,9 @@ import pytest
 
 @pytest.fixture
 def static_pool(monkeypatch):
-    pytest.importorskip("ray", reason="requires the manager runtime import", exc_type=ImportError)
-    from relax.distributed.ray import multi_engine_manager as module
+    from relax.distributed.ray import inference_manager as module
 
-    manager = module.MultiEngineManager(
+    manager = module.InferenceManager(
         SimpleNamespace(), num_slots=4, nodes_per_engine=2, engine_actor_cls=object, skip_init=True
     )
     manager._inference_preserves_weights = True
@@ -158,10 +156,12 @@ def test_endpoint_change_advances_generation(static_pool):
 
 @pytest.fixture
 def rollout_pool(monkeypatch):
+    pytest.importorskip("sglang")
+
     import threading
 
     from relax.distributed.ray import rollout
-    from relax.distributed.ray.multi_engine_manager import _InferenceObservation
+    from relax.distributed.ray.inference_manager import _InferenceObservation
 
     manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
     manager.args = SimpleNamespace(fully_async=False, hybrid=False)
@@ -205,6 +205,16 @@ def test_rollout_publication_acknowledgement_is_required(rollout_pool):
 
     manager.mark_inference_weights_updating()
     assert manager.get_inference_snapshot()["models"]["policy"]["state"] == "ONLOADING"
+
+
+def test_rollout_discovery_honors_global_served_model_name(rollout_pool):
+    manager, group, _engine = rollout_pool
+    manager.args.sglang_served_model_name = "published-policy"
+    group.sglang_overrides["model_path"] = "checkpoint-path"
+    manager.mark_inference_weights_ready()
+    snapshot = manager.get_inference_snapshot()
+    assert snapshot["models"]["policy"]["served_model_name"] == "published-policy"
+    assert snapshot["routing"]["aliases"]["published-policy"] == "policy"
 
 
 def test_pd_discovery_never_exposes_stage_workers(rollout_pool):

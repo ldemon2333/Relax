@@ -142,6 +142,53 @@ def test_placement_explicit_genrm_defer_reuses_rollout_bundles_in_later_phase():
     assert plan.total_required == 8
 
 
+def test_deferred_ppo_rejects_persistent_ray_actor_reservation_conflict():
+    args = _args(
+        resource={"actor": [1, 8], "critic": [1, 8], "rollout": [1, 8], "teacher": [1, 8]},
+        rollout_num_gpus=8,
+        teacher_num_gpus_per_engine=8,
+        genrm_model_path=None,
+        inference_defer_roles=["teacher"],
+    )
+
+    with pytest.raises(ValueError, match=r"actor\[0\].*1.2.*actor=0.4.*critic=0.4.*rollout/default=0.2.*teacher"):
+        plan_inference_placement(args)
+
+
+def test_deferred_grpo_three_roles_fit_persistent_fractional_reservations():
+    args = _args(
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8], "genrm": [1, 8]},
+        rollout_num_gpus=8,
+        genrm_num_gpus=8,
+        teacher_num_gpus_per_engine=8,
+        inference_defer_roles=["teacher", "genrm"],
+    )
+
+    assert plan_inference_placement(args).mode == "defer"
+
+
+def test_explicit_genrm_ray_fraction_is_validated_at_its_actual_slice():
+    args = _args(genrm_ray_num_gpus=0.7)
+
+    with pytest.raises(ValueError, match=r"actor\[4\].*1.1.*genrm"):
+        plan_inference_placement(args)
+    args.genrm_ray_num_gpus = 0.6
+    assert plan_inference_placement(args).mode == "split"
+
+
+def test_ppo_split_keeps_persistent_inference_heads_disjoint():
+    args = _args()
+    args.resource["critic"] = [1, 8]
+
+    assert plan_inference_placement(args).mode == "split"
+
+
+@pytest.mark.parametrize("fraction", [-0.1, float("inf"), float("nan"), True])
+def test_invalid_genrm_ray_fraction_rejected_before_resource_creation(fraction):
+    with pytest.raises(ValueError, match="genrm_ray_num_gpus"):
+        plan_inference_placement(_args(genrm_ray_num_gpus=fraction))
+
+
 @pytest.mark.parametrize(
     "override,match",
     [

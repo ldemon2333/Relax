@@ -172,7 +172,7 @@ def test_preflight_loads_existing_yaml_and_stores_serializable_plan(controller_m
 
     def plan(config):
         assert config._inference_rollout_config == {"sglang": [{"name": "policy", "engine_groups": []}]}
-        return SimpleNamespace(mode="split", total_required_gpus=4, to_dict=lambda: expected)
+        return SimpleNamespace(mode="split", total_required_gpus=4, to_dict=lambda: expected, for_role=lambda role: ())
 
     monkeypatch.setattr(module, "plan_inference_placement", plan)
     monkeypatch.setattr(module.ray, "cluster_resources", lambda: {"GPU": 4})

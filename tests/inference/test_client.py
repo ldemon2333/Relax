@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from relax.inference.client import InferenceClient, endpoint_url
-from relax.inference.compat import RoleDiscovery, teacher_base_url
+from relax.inference.compat import RoleDiscovery, public_legacy_discovery, teacher_base_url
 from relax.inference.registry import InferenceRegistry
 from relax.inference.routing import InferenceRoutingError
 from relax.inference.specs import ModelSnapshot, ReplicaSnapshot, RoutingSpec
@@ -22,6 +22,28 @@ def _snapshot(state="READY", url="http://teacher.example:15000"):
         [ModelSnapshot("math", state, "DIRECT", engines=(ReplicaSnapshot("math/0", url, state, state == "READY"),))],
         RoutingSpec(default_model="math", route_key_map={"math-data": "math"}),
     )
+
+
+async def test_wait_for_normalizes_python_310_asyncio_timeout(monkeypatch):
+    from relax.inference import client as module
+
+    class LegacyAsyncioTimeoutError(Exception):
+        pass
+
+    async def legacy_wait_for(_awaitable, *, timeout):
+        assert timeout == 1.5
+        raise LegacyAsyncioTimeoutError
+
+    monkeypatch.setattr(
+        module,
+        "asyncio",
+        SimpleNamespace(wait_for=legacy_wait_for, TimeoutError=LegacyAsyncioTimeoutError),
+    )
+
+    with pytest.raises(TimeoutError) as error:
+        await module._wait_for(object(), 1.5)
+
+    assert isinstance(error.value.__cause__, LegacyAsyncioTimeoutError)
 
 
 async def test_client_caches_snapshots_and_refreshes_expired_endpoints():
@@ -289,6 +311,53 @@ def test_endpoint_url_does_not_accept_an_absolute_redirect_path():
         endpoint_url("http://gateway.example/teacher", "//different.example/generate")
 
 
+async def test_managed_rollout_transport_reuses_loop_cache_and_closes(monkeypatch):
+    from relax.inference import client as module
+
+    instances, calls = [], []
+
+    class Client:
+        def __init__(self, **kwargs):
+            instances.append(self)
+            self.kwargs = kwargs
+            self.closed = False
+
+        async def generate(self, payload, **kwargs):
+            calls.append(kwargs)
+            return payload
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "InferenceClient", Client)
+    monkeypatch.setattr(module, "_loop_clients", None)
+    for _ in range(2):
+        await module.generate_with_discovery(
+            "http://gateway.example/rollout",
+            {"input_ids": [1]},
+            model="policy",
+            headers={"x-smg-routing-key": "session-2"},
+            max_connections=512,
+        )
+    await module.generate_with_discovery(
+        "http://gateway.example/rollout",
+        {"input_ids": [1]},
+        model="policy",
+        timeout=900,
+        max_connections=1024,
+    )
+    assert len(instances) == 2
+    assert instances[0].kwargs["max_connections"] == 512
+    assert instances[1].kwargs == {
+        "discovery_url": "http://gateway.example/rollout",
+        "timeout": 900,
+        "max_connections": 1024,
+    }
+    assert all(call["model"] == "policy" and call["affinity_key"] == "session-2" for call in calls[:2])
+    await module.close_loop_inference_clients()
+    assert all(client.closed for client in instances)
+
+
 async def test_client_connection_limit_allows_configured_rollout_concurrency():
     target = 120
     arrived = 0
@@ -339,3 +408,37 @@ async def test_client_connection_limit_allows_configured_rollout_concurrency():
         release.set()
         server.close()
         await server.wait_closed()
+
+
+def test_public_legacy_discovery_omits_followers_private_metadata_and_pd_workers():
+    diagnostics = {
+        "total_engines": 3,
+        "models": {
+            "policy": {
+                "total_engines": 3,
+                "engine_groups": [
+                    {
+                        "worker_type": "regular",
+                        "engines": [
+                            {
+                                "rank": 0,
+                                "status": "active",
+                                "url": "http://head.example",
+                                "pid": 12,
+                                "node_id": "node-a",
+                            },
+                            {"rank": 1, "status": "active", "pid": 13, "node_id": "node-b"},
+                        ],
+                    },
+                    {"worker_type": "prefill", "engines": [{"url": "http://prefill.example"}]},
+                ],
+            },
+        },
+    }
+    public = public_legacy_discovery(diagnostics)
+    assert public["total_engines"] == 1
+    assert public["models"]["policy"]["engine_groups"][0]["engines"] == [
+        {"rank": 0, "status": "active", "url": "http://head.example"}
+    ]
+    assert public["models"]["policy"]["engine_groups"][1]["engines"] == []
+    assert diagnostics["total_engines"] == 3

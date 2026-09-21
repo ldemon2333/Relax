@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -18,6 +19,45 @@ from relax.inference.specs import validate_snapshot
 
 
 SnapshotProvider = Callable[[], Awaitable[dict[str, Any]]]
+_loop_clients: Any = None
+
+
+async def _wait_for(awaitable: Awaitable[Any], timeout: float) -> Any:
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError from exc
+
+
+async def generate_with_discovery(
+    discovery_url: str,
+    payload: dict[str, Any],
+    *,
+    model: str | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 1800.0,
+    max_connections: int | None = None,
+) -> dict[str, Any]:
+    global _loop_clients
+    if _loop_clients is None:
+        _loop_clients = weakref.WeakKeyDictionary()
+    loop = asyncio.get_running_loop()
+    cache = _loop_clients.setdefault(loop, {})
+    cache_key = (discovery_url, timeout, max_connections)
+    if cache_key not in cache:
+        cache[cache_key] = InferenceClient(
+            discovery_url=discovery_url, timeout=timeout, max_connections=max_connections
+        )
+    client = cache[cache_key]
+    affinity = next((value for key, value in (headers or {}).items() if key.lower() == "x-smg-routing-key"), None)
+    return await client.generate(payload, model=model, headers=headers, affinity_key=affinity)
+
+
+async def close_loop_inference_clients() -> None:
+    if _loop_clients is None:
+        return
+    clients = _loop_clients.pop(asyncio.get_running_loop(), {})
+    await asyncio.gather(*(client.aclose() for client in clients.values()))
 
 
 class _DeadlineStream(httpx.AsyncByteStream):
@@ -30,7 +70,7 @@ class _DeadlineStream(httpx.AsyncByteStream):
         iterator = self.source.__aiter__()
         while True:
             try:
-                yield await asyncio.wait_for(iterator.__anext__(), timeout=max(0.0, self.deadline - self.clock()))
+                yield await _wait_for(iterator.__anext__(), max(0.0, self.deadline - self.clock()))
             except StopAsyncIteration:
                 return
 
@@ -97,7 +137,7 @@ class InferenceClient:
                 return copy.deepcopy(self._snapshot)
             self.invalidate()
             if self._provider is not None:
-                snapshot = await asyncio.wait_for(self._provider(), timeout=self.timeout)
+                snapshot = await _wait_for(self._provider(), self.timeout)
             else:
                 response = await self._http.get(
                     endpoint_url(self.discovery_url, "/engines"),
@@ -135,6 +175,8 @@ class InferenceClient:
             outgoing["model"] = target.model_id
         else:
             outgoing.pop("route_key", None)
+            if path == "/generate":
+                outgoing.pop("model", None)
             if path in {"/chat/completions", "/v1/chat/completions"}:
                 if target.served_model_name is None:
                     raise InferenceRoutingError(503, "Discovery does not declare the backend served model name")
@@ -151,8 +193,7 @@ class InferenceClient:
         affinity_key: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """Make one POST under an end-to-end deadline, including discovery."""
-        return await asyncio.wait_for(
+        return await _wait_for(
             self._request(path, payload, model, route_key, affinity_key, headers), timeout=self.timeout
         )
 
@@ -199,9 +240,7 @@ class InferenceClient:
         headers: dict[str, str] | None = None,
     ) -> AsyncIterator[httpx.Response]:
         deadline = self._clock() + self.timeout
-        target = await asyncio.wait_for(
-            self._request_target(payload, model, route_key, affinity_key), timeout=self.timeout
-        )
+        target = await _wait_for(self._request_target(payload, model, route_key, affinity_key), self.timeout)
         outgoing = self._outgoing_payload(path, payload, target)
         forward_headers = httpx.Headers(headers or {})
         if affinity_key is not None:
@@ -215,9 +254,7 @@ class InferenceClient:
                 headers=forward_headers,
                 timeout=self.timeout,
             )
-            response = await asyncio.wait_for(
-                self._http.send(request, stream=True), timeout=max(0.0, deadline - self._clock())
-            )
+            response = await _wait_for(self._http.send(request, stream=True), max(0.0, deadline - self._clock()))
             response.raise_for_status()
             response.stream = _DeadlineStream(response.stream, deadline, self._clock)
             yield response

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from types import MappingProxyType
@@ -209,6 +210,45 @@ def _genrm_models(args: Any) -> dict[str, dict]:
     }
 
 
+def _validate_persistent_ray_reservations(
+    args: Any, placements: Sequence[InferencePlacement], training: Mapping[str, int], *, colocate: bool
+) -> None:
+    reservations: dict[tuple[str, int], list[tuple[str, float]]] = {}
+
+    def reserve(pool: str, index: int, name: str, fraction: float) -> None:
+        reservations.setdefault((pool, index), []).append((name, fraction))
+
+    actor_gpus = training.get("actor", 0)
+    for role, count in training.items():
+        if role not in {"actor", "critic", "actor_fwd", "reference"}:
+            continue
+        shared = colocate and (role == "actor" or (role == "critic" and count == actor_gpus))
+        for index in range(count):
+            reserve("actor" if shared else role, index, role, 0.4)
+    for placement in placements:
+        if placement.worker_type == "placeholder":
+            continue
+        fraction = 0.2
+        if placement.role == "genrm":
+            default = 0.1 if getattr(args, "_genrm_colocate_with_rollout", False) else 0.2
+            fraction = getattr(args, "genrm_ray_num_gpus", default)
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction):
+                raise ValueError("genrm_ray_num_gpus must be a finite nonnegative number")
+            if fraction < 0:
+                raise ValueError("genrm_ray_num_gpus must be nonnegative")
+        local_gpus = min(placement.gpus_per_engine, placement.num_gpus_per_node)
+        for index in range(placement.bundle_start, placement.bundle_stop, local_gpus):
+            reserve(placement.pool, index, f"{placement.role}/{placement.model_id}", fraction)
+    for (pool, index), claims in reservations.items():
+        total = sum(fraction for _name, fraction in claims)
+        if total > 1.0 + 1e-9:
+            details = ", ".join(f"{name}={fraction:g}" for name, fraction in claims)
+            raise ValueError(
+                f"Persistent Ray GPU reservations exceed bundle {pool}[{index}]: {total:g} > 1 ({details}). "
+                "Offloading model memory does not release Ray actor GPU reservations"
+            )
+
+
 def plan_inference_placement(args: Any) -> InferencePlacementPlan:
     resource = _resource(args)
     per_node = _positive(getattr(args, "num_gpus_per_node", 8), "num_gpus_per_node")
@@ -355,6 +395,7 @@ def plan_inference_placement(args: Any) -> InferencePlacementPlan:
     for placement in placements:
         pools[placement.pool] = max(pools.get(placement.pool, 0), placement.bundle_stop)
     mode = "defer" if deferred_roles else "split" if colocate else "decoupled"
+    _validate_persistent_ray_reservations(args, placements, training, colocate=colocate)
     return InferencePlacementPlan(mode, tuple(placements), sum(pools.values()), pools, training)
 
 

@@ -1,14 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+from dataclasses import replace
+
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.core.service import create_placement_group
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.core.service import create_placement_group, get_placement_group_topology
+from relax.distributed.ray.inference_manager import InferenceManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
+from relax.inference.placement import model_placement, validate_bound_placement
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
@@ -57,7 +60,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
 
 
 @ray.remote
-class TeacherManager(MultiEngineManager):
+class TeacherManager(InferenceManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
     def __init__(
@@ -76,8 +79,6 @@ class TeacherManager(MultiEngineManager):
             _pg, bundle_indices, gpu_ids = pg
             required = int(args.rollout_num_gpus) + bundle_offset + gpus_per_replica * num_replicas
             if getattr(args, "_inference_placement_plan", None) is not None:
-                from relax.inference.placement import model_placement
-
                 placement = model_placement(args, "teacher", getattr(args, "_inference_model_id", "__default__"))
                 if placement is None:
                     raise ValueError("Teacher is absent from the validated placement plan")
@@ -108,9 +109,6 @@ class TeacherManager(MultiEngineManager):
         self._inference_role = "teacher"
         self._inference_model_id = getattr(args, "_inference_model_id", "__default__")
         if getattr(args, "_inference_placement_plan", None) is not None:
-            from relax.core.service import get_placement_group_topology
-            from relax.inference.placement import model_placement, validate_bound_placement
-
             self._planned_placement = model_placement(args, "teacher", self._inference_model_id)
             if self._planned_placement is None:
                 raise ValueError("Teacher model missing from validated placement plan")
@@ -158,7 +156,6 @@ class TeacherManager(MultiEngineManager):
         return super().recover()
 
     # ------------------------------------------------------------------
-    # MultiEngineManager hooks.
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank: int):
@@ -189,11 +186,6 @@ class TeacherManager(MultiEngineManager):
             )
             try:
                 if self._planned_placement is not None:
-                    from dataclasses import replace
-
-                    from relax.core.service import get_placement_group_topology
-                    from relax.inference.placement import validate_bound_placement
-
                     validate_bound_placement(
                         replace(self._planned_placement, bundle_start=0, num_gpus=self.gpus_per_replica),
                         get_placement_group_topology(pg_tuple),

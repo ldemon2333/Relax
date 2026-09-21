@@ -2,11 +2,15 @@
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 
 import aiohttp
 import numpy as np
 
+from relax.inference.client import InferenceClient
+from relax.inference.routing import InferenceRoutingError
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
 from relax.utils.types import Sample
@@ -151,6 +155,56 @@ class OpdManager:
 
         opsd_worker = opd_opsd_worker.OpsdWorker.from_args(args)
         self.opsd_worker = opsd_worker if opsd_worker.is_opsd else None
+        self._inference_clients: dict[aiohttp.ClientSession, Any] = {}
+
+    @asynccontextmanager
+    async def _teacher_session(self) -> AsyncIterator[aiohttp.ClientSession]:
+        async with _create_teacher_client_session(self.args) as session:
+            client = None
+            discovery_url = getattr(self.args, "_inference_teacher_discovery_url", None)
+            if discovery_url:
+                client = InferenceClient(discovery_url=discovery_url, timeout=float(self.args.opd_teacher_timeout_s))
+                self._inference_clients[session] = client
+            try:
+                yield session
+            finally:
+                self._inference_clients.pop(session, None)
+                if client is not None:
+                    await client.aclose()
+
+    def _managed_teacher_route(self, sample: Sample) -> tuple[str | None, str | None]:
+        route_key = None
+        if getattr(self.args, "opd_teacher_routes_map", None) or getattr(self.args, "opd_teacher_routes", None):
+            key_field = getattr(self.args, "opd_teacher_key", None) or "data_source"
+            route_key = (sample.metadata or {}).get(key_field)
+            if route_key is None:
+                raise ValueError(f"MOPD routing: sample missing key {key_field!r} in metadata")
+            if not isinstance(route_key, str) or not route_key:
+                raise ValueError("MOPD routing metadata must identify a nonempty Teacher route")
+        group = getattr(sample, "group_index", None)
+        affinity = json.dumps([route_key, group], separators=(",", ":")) if group is not None else None
+        return route_key, affinity
+
+    async def _managed_teacher_logprob(
+        self, session: aiohttp.ClientSession, payload: dict, sample: Sample
+    ) -> opd_main_worker.LogprobResponse | None:
+
+        route_key, affinity_key = self._managed_teacher_route(sample)
+        client = self._inference_clients.get(session)
+        if client is None:
+            raise RuntimeError("Managed Teacher requires a scoped inference client session")
+        try:
+            normalized_payload = json.loads(_dumps_to_bytes(payload))
+            data = await client.generate(normalized_payload, route_key=route_key, affinity_key=affinity_key)
+        except InferenceRoutingError as exc:
+            if exc.status_code == 400:
+                raise KeyError(f"MOPD routing: {exc}") from exc
+            logger.error("Managed OPD Teacher unavailable for sample_index=%s: %s", sample.index, exc)
+            return None
+        except Exception as exc:
+            logger.error("Managed OPD Teacher fetch failed for sample_index=%s: %s", sample.index, type(exc).__name__)
+            return None
+        return opd_main_worker.LogprobResponse(data)
 
     @property
     def is_topk(self) -> bool:
@@ -243,7 +297,7 @@ class OpdManager:
         if self.opsd_worker is not None:
             await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
 
-        async with _create_teacher_client_session(self.args) as session:
+        async with self._teacher_session() as session:
             fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
             self._raise_if_all_failed(sample_list, fetch_results)
 
@@ -271,7 +325,7 @@ class OpdManager:
             sample.teacher_topk_token_ids = None
             sample.teacher_topk_log_probs = None
             sample.teacher_at_student_topk_log_probs = None
-        async with _create_teacher_client_session(self.args) as session:
+        async with self._teacher_session() as session:
             results = await asyncio.gather(
                 *[self._teacher_prefill(sample, session) for sample in active], return_exceptions=True
             )
@@ -426,8 +480,11 @@ class OpdManager:
             if mm_fields:
                 payload.update(mm_fields)
 
-        teacher_url = _pick_teacher_url(self.args, sample)
-        resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
+        if getattr(self.args, "_inference_teacher_discovery_url", None):
+            resp_obj = await self._managed_teacher_logprob(session, payload, sample)
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
+            resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
             return False
 

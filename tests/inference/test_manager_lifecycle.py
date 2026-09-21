@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 
 from relax.distributed.ray import inference_manager as module
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 
 
 class _Method:
@@ -115,10 +114,6 @@ def runtime(monkeypatch):
     monkeypatch.setattr(module.ray, "kill", kill)
     monkeypatch.setattr(module, "remove_placement_group", remove)
     return runtime
-
-
-def test_legacy_manager_import_is_shared_core_alias():
-    assert MultiEngineManager is module.InferenceManager
 
 
 @pytest.mark.parametrize("phase", ["placement", "actor", "ports", "init_submission", "warmup"])

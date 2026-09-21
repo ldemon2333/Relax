@@ -6,6 +6,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+pytest.importorskip("sglang")
+
 from relax.distributed.ray import teacher_manager
 
 

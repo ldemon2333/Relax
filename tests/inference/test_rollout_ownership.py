@@ -72,6 +72,8 @@ async def test_workload_deferred_entry_keeps_original_facade_for_local_lifecycle
 
 @pytest.fixture
 def manager_class():
+    pytest.importorskip("sglang")
+
     from relax.distributed.ray.rollout import RolloutManager
 
     return RolloutManager.__ray_metadata__.modified_class

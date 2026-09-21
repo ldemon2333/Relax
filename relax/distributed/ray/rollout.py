@@ -23,10 +23,18 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.inference_manager import InferenceCleanupError, InferenceManager
-from relax.distributed.ray.multi_engine_manager import _InferenceObservation, _model_discovery_state
+from relax.core.service import get_placement_group_topology
+from relax.distributed.ray.inference_manager import (
+    InferenceCleanupError,
+    InferenceManager,
+    _InferenceObservation,
+    _is_actor_confirmed_dead,
+    _model_discovery_state,
+)
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.distributed.ray.rollout_workload import RolloutWorkload
+from relax.inference.placement import validate_bound_placement
+from relax.inference.specs import RoutingSpec
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -456,6 +464,7 @@ class EngineGroup:
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
     external_engines: bool = False
+    replica_urls: dict[int, str] = dataclasses.field(default_factory=dict)
 
     @property
     def nodes_per_engine(self):
@@ -2403,6 +2412,17 @@ class RolloutManager(ReloadableMixin):
             workers = engine_group.all_engines[head : head + engine_group.nodes_per_engine]
             key = f"{srv.model_name}/group-{engine_group.rank_offset}/replica-{head // engine_group.nodes_per_engine}"
             observation.initialized(key, workers, weights_ready=False)
+            if workers and workers[0] is not None:
+                try:
+                    head_url = await asyncio.wait_for(workers[0].get_url.remote(), timeout=5.0)
+                except Exception as e:
+                    logger.warning(f"{log_prefix} {replica_str}: failed to record URL for {key}: {e}")
+                    head_url = None
+                if head_url:
+                    with self._engine_lifecycle_lock:
+                        engine_group.replica_urls[head // engine_group.nodes_per_engine] = self._normalize_engine_addr(
+                            head_url
+                        )
             if workers and id(workers[0]) in admitted:
                 try:
                     version = await asyncio.wait_for(workers[0].get_weight_version.remote(), timeout=5.0)
@@ -3370,9 +3390,6 @@ class RolloutManager(ReloadableMixin):
 
     @ray.method(concurrency_group="scale_out")
     def get_inference_snapshot(self) -> dict[str, Any]:
-        """Publish logical ingress discovery without changing legacy
-        diagnostics."""
-        from relax.inference.specs import RoutingSpec
 
         observation = self._get_inference_observation()
         with self._engine_lifecycle_lock, observation.lock:
@@ -3388,8 +3405,8 @@ class RolloutManager(ReloadableMixin):
                     overrides = group.sglang_overrides
                     served_model_names.add(
                         overrides.get("served_model_name")
-                        or overrides.get("model_path")
                         or getattr(self.args, "sglang_served_model_name", None)
+                        or overrides.get("model_path")
                         or getattr(self.args, "hf_checkpoint", None)
                     )
                     group_replicas = []
@@ -3847,7 +3864,12 @@ class RolloutManager(ReloadableMixin):
             raise ValueError(f"Model '{model_name}' not found")
 
         # Count initial (non-scaled-out) engines to enforce the lower bound.
-        initial_count = sum(1 for g in srv.engine_groups if not g.is_scaled_out for e in g.engines if e is not None)
+        initial_count = sum(
+            1
+            for group in srv.engine_groups
+            if not group.is_scaled_out
+            for _ in self._get_live_engine_representatives(group)
+        )
 
         if num_replicas > 0:
             if num_replicas < initial_count:
@@ -3859,7 +3881,7 @@ class RolloutManager(ReloadableMixin):
                         f"num_replicas={num_replicas} < initial_engines={initial_count}"
                     ),
                 }
-            current_total = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
+            current_total = sum(1 for group in srv.engine_groups for _ in self._get_live_engine_representatives(group))
             if current_total <= num_replicas:
                 return {
                     "request_id": str(uuid.uuid4()),
@@ -3932,6 +3954,7 @@ class RolloutManager(ReloadableMixin):
 
         selected_groups: dict[int, EngineGroup] = {}
         completed_eviction_groups: set[int] = set()
+        failed_cleanup_groups: set[int] = set()
         try:
             url_candidates = None
             if request.engine_urls:
@@ -4004,6 +4027,12 @@ class RolloutManager(ReloadableMixin):
             request.update_status(ScaleInStatus.REMOVING)
             request.removed_engines = removed
             request.failed_engines = failed
+            failed_ids = set(failed)
+            failed_cleanup_groups = {
+                id(group)
+                for group, node0_idx in engine_infos
+                if f"group_{group.rank_offset}_engine_{node0_idx}" in failed_ids
+            }
             completed_eviction_groups = {
                 id(group)
                 for group, node0_idx in engine_infos
@@ -4031,7 +4060,11 @@ class RolloutManager(ReloadableMixin):
                 for group in selected_groups.values():
                     if id(group) in completed_eviction_groups:
                         group.eviction_requested = False
-                    if not group.eviction_requested and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                    if (
+                        id(group) not in failed_cleanup_groups
+                        and not group.eviction_requested
+                        and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                    ):
                         group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
     async def _resolve_scale_in_url_candidates(self, request: ScaleInRequest, srv) -> list:
@@ -4039,21 +4072,28 @@ class RolloutManager(ReloadableMixin):
         target_urls = {self._normalize_engine_addr(url) for url in request.engine_urls}
         with self._engine_lifecycle_lock:
             snapshots = [
-                (group, node0_idx, engine)
+                (group, node0_idx, engine, group.all_engines[node0_idx * group.nodes_per_engine])
                 for group in srv.engine_groups
                 if group.is_scaled_out
                 and group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
-                for node0_idx, engine in enumerate(group.engines)
-                if engine is not None
+                for node0_idx, engine in self._get_live_engine_representatives(group)
             ]
 
-        async def _resolve(group, node0_idx, engine):
-            try:
-                url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
-                if url and self._normalize_engine_addr(url) in target_urls:
-                    return group, node0_idx, engine
-            except Exception as e:
-                logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
+        async def _resolve(group, node0_idx, engine, head):
+            url = None
+            if head is not None:
+                try:
+                    url = await asyncio.wait_for(head.get_url.remote(), timeout=5)
+                except Exception as e:
+                    logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
+            with self._engine_lifecycle_lock:
+                if url:
+                    normalized = self._normalize_engine_addr(url)
+                    group.replica_urls[node0_idx] = normalized
+                else:
+                    normalized = group.replica_urls.get(node0_idx)
+            if normalized is not None and normalized in target_urls:
+                return group, node0_idx, engine
             return None
 
         results = await asyncio.gather(*[_resolve(*snapshot) for snapshot in snapshots])
@@ -4078,10 +4118,10 @@ class RolloutManager(ReloadableMixin):
                     EngineGroupLifecycle.DRAINING,
                 ):
                     continue
-                for node0_idx, engine in enumerate(group.engines):
-                    if engine is not None:
-                        engine_snapshots.append((group, node0_idx, engine))
-            current_total = sum(1 for group in srv.engine_groups for engine in group.engines if engine is not None)
+                engine_snapshots.extend(
+                    (group, node0_idx, engine) for node0_idx, engine in self._get_live_engine_representatives(group)
+                )
+            current_total = sum(1 for group in srv.engine_groups for _ in self._get_live_engine_representatives(group))
 
         if request.num_replicas > 0:
             # Count ALL live engines (initial + scaled-out) to decide how many
@@ -4148,15 +4188,20 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
             shutdown_targets.append(target)
 
-        await asyncio.gather(
+        shutdown_results = await asyncio.gather(
             *[
                 self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
                 for group, _, engine_id, live_actors in shutdown_targets
-            ]
+            ],
+            return_exceptions=True,
         )
-        for _, _, engine_id, _ in shutdown_targets:
-            removed.append(engine_id)
-            logger.info(f"[ScaleIn] Removed engine {engine_id}")
+        for (_, _, engine_id, _), result in zip(shutdown_targets, shutdown_results, strict=True):
+            if isinstance(result, BaseException):
+                failed.append(engine_id)
+                logger.warning(f"[ScaleIn] Cleanup failed for engine {engine_id}: {result}")
+            else:
+                removed.append(engine_id)
+                logger.info(f"[ScaleIn] Removed engine {engine_id}")
 
         self._cleanup_engine_groups(srv)
         return removed, failed
@@ -4229,6 +4274,21 @@ class RolloutManager(ReloadableMixin):
         return unregistered_engine_infos, failed_engine_ids
 
     @staticmethod
+    def _get_live_engine_representatives(group) -> list[tuple[int, object]]:
+        representatives = []
+        replica_count = (len(group.all_engines) + group.nodes_per_engine - 1) // group.nodes_per_engine
+        for node0_idx in range(replica_count):
+            start = node0_idx * group.nodes_per_engine
+            stop = min(start + group.nodes_per_engine, len(group.all_engines))
+            representative = next(
+                (group.all_engines[i] for i in range(start, stop) if group.all_engines[i] is not None),
+                None,
+            )
+            if representative is not None:
+                representatives.append((node0_idx, representative))
+        return representatives
+
+    @staticmethod
     def _get_live_engine_actors(group, node0_idx: int) -> list[tuple[int, object]]:
         nodes_per_engine = group.nodes_per_engine
         indices = range(node0_idx * nodes_per_engine, (node0_idx + 1) * nodes_per_engine)
@@ -4271,7 +4331,7 @@ class RolloutManager(ReloadableMixin):
         failures = []
         released = []
         for (i, engine), result in zip(live_actors, shutdown_results):
-            if isinstance(result, BaseException):
+            if isinstance(result, BaseException) and not _is_actor_confirmed_dead(result):
                 logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
                 failures.append(i)
                 continue
@@ -4500,8 +4560,7 @@ class RolloutManager(ReloadableMixin):
                     or group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
                     or not group.is_scaled_out
                     or group.pg is None
-                    or node0_idx >= len(group.engines)
-                    or group.engines[node0_idx] is None
+                    or not self._get_live_engine_actors(group, node0_idx)
                 ):
                     continue
                 group.eviction_requested = True
@@ -4914,9 +4973,6 @@ def _start_rollout_servers(args, pg, servers: dict[str, RolloutServer]) -> dict[
     as the HTTP client is shared across all servers.
     """
     if getattr(args, "_inference_placement_plan", None) is not None:
-        from relax.core.service import get_placement_group_topology
-        from relax.inference.placement import validate_bound_placement
-
         topology = get_placement_group_topology(pg)
         for placement in args._inference_placement_plan["placements"]:
             if placement["role"] == "rollout":

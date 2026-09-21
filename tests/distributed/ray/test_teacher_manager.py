@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+
+pytest.importorskip("sglang")
+
 from relax.distributed.ray import teacher_manager as teacher_manager_module
 
 
@@ -83,9 +86,11 @@ def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
 
 def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
+    from relax.distributed.ray.inference_manager import InferenceManager
 
     assert hasattr(teacher_manager.TeacherManager, "remote")
     assert hasattr(teacher_manager.TeacherManager, "options")
+    assert issubclass(teacher_manager.TeacherManager.__ray_metadata__.modified_class, InferenceManager)
 
 
 def test_teacher_recovery_reuses_original_endpoint(monkeypatch):

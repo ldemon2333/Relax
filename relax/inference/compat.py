@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -20,6 +21,25 @@ def teacher_base_url(url: str) -> str:
     if path.endswith("/generate"):
         path = path[: -len("/generate")]
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def public_legacy_discovery(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(diagnostics)
+    result["total_engines"] = 0
+    for model in result.get("models", {}).values():
+        model["total_engines"] = 0
+        for group in model.get("engine_groups", []):
+            engines = []
+            if group.get("worker_type", "regular") == "regular":
+                engines = [
+                    {key: engine[key] for key in ("rank", "status", "url") if key in engine}
+                    for engine in group.get("engines", [])
+                    if engine.get("url")
+                ]
+            group["engines"] = engines
+            model["total_engines"] += len(engines)
+        result["total_engines"] += model["total_engines"]
+    return result
 
 
 class RoleDiscovery:

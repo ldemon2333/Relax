@@ -13,7 +13,7 @@ import httpx
 from fastapi import HTTPException, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
-from relax.inference.client import InferenceClient, SnapshotProvider
+from relax.inference.client import InferenceClient, SnapshotProvider, _wait_for
 from relax.inference.routing import InferenceRoutingError, RouteResolver
 from relax.inference.specs import INFERENCE_ROLES, validate_snapshot
 
@@ -213,7 +213,7 @@ class InferenceGatewayHandler:
         self, payload: dict[str, Any], headers: Mapping[str, str] | None = None
     ) -> dict[str, Any] | StreamingResponse:
         async with _http_errors():
-            return await asyncio.wait_for(self._generate(payload, headers), timeout=self._client.timeout)
+            return await _wait_for(self._generate(payload, headers), self._client.timeout)
 
     async def _generate(
         self, payload: dict[str, Any], headers: Mapping[str, str] | None

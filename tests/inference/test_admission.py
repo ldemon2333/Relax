@@ -362,6 +362,50 @@ def test_dynamic_guard_waits_for_weight_continue_and_full_resident_tags(sglang_e
     assert engine._admission_server.gate.status()["ready"]
 
 
+def test_defer_backup_overrides_parser_default_but_rejects_explicit_group_false(sglang_engine_module, monkeypatch):
+    import dataclasses
+    from types import SimpleNamespace
+
+    module = sglang_engine_module
+    names = (
+        "model_path trust_remote_code random_seed enable_memory_saver host port nccl_port nnodes node_rank "
+        "dist_init_addr gpu_id_step base_gpu_id tp_size dp_size pp_size ep_size skip_server_warmup "
+        "enable_draft_weights_cpu_backup enable_metrics enable_weights_cpu_backup"
+    ).split()
+    server_args = dataclasses.make_dataclass("ServerArgs", [(name, object, None) for name in names])
+    monkeypatch.setattr(module, "ServerArgs", server_args)
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
+    monkeypatch.setattr(module, "_enable_draft_weights_cpu_backup", lambda *args: False)
+    monkeypatch.setattr(module, "is_lora_enabled", lambda args: False)
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=1,
+        num_gpus_per_node=1,
+        hf_checkpoint="policy",
+        seed=1,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+        sglang_enable_weights_cpu_backup=False,
+        _inference_preserve_rollout_weights=True,
+    )
+    kwargs, _ = module._compute_server_args(args, 0, "worker.example:1", 2, "worker.example", 3, base_gpu_id=0)
+    assert kwargs["enable_weights_cpu_backup"] is True
+    with pytest.raises(ValueError, match="CPU weight backup"):
+        module._compute_server_args(
+            args,
+            0,
+            "worker.example:1",
+            2,
+            "worker.example",
+            3,
+            base_gpu_id=0,
+            sglang_overrides={"enable_weights_cpu_backup": False},
+        )
+
+
 def test_guarded_offload_aborts_and_flushes_before_releasing(sglang_engine_module, monkeypatch):
     from types import SimpleNamespace
 
