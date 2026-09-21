@@ -11,7 +11,6 @@ and OPD teacher recovery/offload-onload.
 
 from __future__ import annotations
 
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +18,7 @@ import pytest
 
 pytest.importorskip("ray", reason="requires ray", exc_type=ImportError)
 
+from relax.distributed.ray import inference_manager
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 
 
@@ -56,6 +56,7 @@ class _FakeManager(MultiEngineManager):
         self._dead_at_init: set[int] = set()
         self._removed_pg = False
         self._instance_owns_pg = owns_pg
+        self._inference_preserves_weights = True
         super().__init__(
             SimpleNamespace(),
             num_slots=num_slots,
@@ -235,12 +236,8 @@ def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
 
 
 def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray, monkeypatch):
-    # ray.util.placement_group is shadowed as an attribute by a same-named
-    # function on the ray.util package, so it must be patched via sys.modules
-    # (where the actual submodule lives) rather than a dotted monkeypatch path.
-    placement_group_submodule = sys.modules["ray.util.placement_group"]
     removed_pgs = []
-    monkeypatch.setattr(placement_group_submodule, "remove_placement_group", lambda pg: removed_pgs.append(pg))
+    monkeypatch.setattr(inference_manager, "remove_placement_group", lambda pg: removed_pgs.append(pg))
 
     owning_manager = _FakeManager(num_slots=1, owns_pg=True)
     owning_manager.shutdown()
@@ -252,10 +249,6 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     assert removed_pgs == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Legacy onload marks weights-only restore complete and skips the later full restore (Task 3 P3)",
-)
 def test_multi_engine_manager_partial_resume_does_not_skip_full_resume(_patch_ray):
     manager = _FakeManager(num_slots=1)
     engine = manager.all_engines[0]
@@ -269,13 +262,10 @@ def test_multi_engine_manager_partial_resume_does_not_skip_full_resume(_patch_ra
         "release_memory_occupation",
         "resume_memory_occupation",
         "resume_memory_occupation",
+        "continue_generation",
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Legacy shutdown visits only logical heads and leaves follower actors running (Task 3 P3)",
-)
 def test_multi_engine_manager_shutdown_retires_all_multinode_worker_slots(_patch_ray):
     manager = _FakeManager(num_slots=4, nodes_per_engine=2)
     original_engines = list(manager.all_engines)

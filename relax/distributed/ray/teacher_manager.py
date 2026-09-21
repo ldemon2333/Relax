@@ -8,10 +8,11 @@ from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
-from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
+from relax.utils.opd.opd_utils import build_teacher_overrides
 
 
 logger = get_logger(__name__)
@@ -86,8 +87,9 @@ class TeacherManager(MultiEngineManager):
         self._bundle_offset = bundle_offset
 
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
+        self._engine_spec = InferenceEngineSpec("teacher")
+        self._teacher_args, overrides = build_static_engine_config(args, "teacher", overrides)
         self._overrides = overrides
-        self._teacher_args = build_teacher_engine_args(args, overrides)
         self._inference_role = "teacher"
         self._inference_model_id = "__default__"
         self._inference_served_model_name = overrides.get("served_model_name") or overrides.get("model_path")
@@ -174,6 +176,7 @@ class TeacherManager(MultiEngineManager):
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
             "register_sigterm_handler": False,
+            "engine_spec": self._engine_spec,
         }
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:

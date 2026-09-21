@@ -73,7 +73,7 @@ def test_follower_failure_fences_its_entire_replica(static_pool, failure):
     assert after["topology_revision"] > before["topology_revision"]
 
 
-def test_static_partial_restore_does_not_inherit_legacy_onloaded_boolean(static_pool):
+def test_static_partial_restore_requires_remaining_tags_before_readiness(static_pool):
     manager, engines, _module = static_pool
     initial = manager.get_inference_snapshot()
 
@@ -87,11 +87,11 @@ def test_static_partial_restore_does_not_inherit_legacy_onloaded_boolean(static_
         engine.health_process.remote.assert_not_called()
 
     manager.onload(tags=["weights"])
-    assert manager.is_onloaded()  # The legacy boolean retains its historical behavior.
+    assert not manager.is_onloaded()
     partial = manager.get_inference_snapshot()
     assert _model(partial)["state"] == "ONLOADING"
-    manager.onload()  # The legacy early return must not acknowledge unperformed work.
-    assert _model(manager.get_inference_snapshot())["state"] == "ONLOADING"
+    manager.onload()
+    assert _model(manager.get_inference_snapshot())["state"] == "READY"
     assert partial["topology_revision"] > asleep["topology_revision"] > initial["topology_revision"]
 
 
@@ -127,7 +127,7 @@ def test_failed_offload_publishes_failure_without_fake_release(static_pool, monk
     with pytest.raises(ValueError, match="release failed"):
         manager.offload()
 
-    assert manager.is_onloaded()
+    assert not manager.is_onloaded()
     assert _model(manager.get_inference_snapshot())["state"] == "FAILED"
 
 
@@ -215,4 +215,63 @@ def test_pd_discovery_never_exposes_stage_workers(rollout_pool):
     model = manager.get_inference_snapshot()["models"]["policy"]
 
     assert model["engines"] == []
-    assert model["state"] != "READY"  # Missing decode stage cannot serve a request.
+    assert model["state"] != "READY"
+
+
+def _route_target(snapshot):
+    from relax.inference.routing import RouteResolver
+
+    return RouteResolver().resolve(snapshot, model=None, route_key=None, affinity_key=None)
+
+
+def test_external_rollout_without_local_process_becomes_routable(rollout_pool):
+    manager, _group, engine = rollout_pool
+    manager.args.rollout_external = True
+    engine.health_process.remote.return_value = None
+    manager.mark_inference_weights_ready()
+
+    snapshot = manager.get_inference_snapshot()
+
+    assert snapshot["models"]["policy"]["state"] == "READY"
+    engine.health_process.remote.assert_not_called()
+    engine.health_generate.remote.assert_called()
+    assert _route_target(snapshot).base_url == "http://router.example:16000"
+
+
+def test_external_scale_out_group_skips_process_probe(rollout_pool):
+    manager, group, engine = rollout_pool
+    group.external_engines = True
+    engine.health_process.remote.return_value = None
+    manager.mark_inference_weights_ready()
+
+    assert manager.get_inference_snapshot()["models"]["policy"]["state"] == "READY"
+    engine.health_process.remote.assert_not_called()
+
+
+def test_custom_rollout_engine_without_process_probe_becomes_routable(rollout_pool, monkeypatch):
+    from relax.distributed.ray import rollout
+
+    class NativeEngine:
+        def health_generate(self):
+            return True
+
+        def get_url(self):
+            return "http://native.example:15000"
+
+    manager, _group, engine = rollout_pool
+    monkeypatch.setattr(rollout, "_resolve_rollout_engine_class", lambda args: NativeEngine)
+    engine.health_process.remote.side_effect = AttributeError("health_process")
+    manager.mark_inference_weights_ready()
+
+    snapshot = manager.get_inference_snapshot()
+
+    assert snapshot["models"]["policy"]["state"] == "READY"
+    assert _route_target(snapshot).model_id == "policy"
+
+
+def test_local_rollout_unknown_process_still_fences_replica(rollout_pool):
+    manager, _group, engine = rollout_pool
+    engine.health_process.remote.return_value = None
+    manager.mark_inference_weights_ready()
+
+    assert manager.get_inference_snapshot()["models"]["policy"]["state"] != "READY"

@@ -453,6 +453,7 @@ class EngineGroup:
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    external_engines: bool = False
 
     @property
     def nodes_per_engine(self):
@@ -2402,6 +2403,7 @@ class RolloutManager(ReloadableMixin):
                 router_port=router_port,
                 is_scaled_out=True,
                 skip_dcs_registration=False,  # Already registered above
+                external_engines=True,
             )
         else:
             # Mark DCS registration as done (for ray_native mode)
@@ -3359,11 +3361,13 @@ class RolloutManager(ReloadableMixin):
                     continue
                 try:
                     version = ray.get(workers[0].get_weight_version.remote(), timeout=5.0)
+                    if version is None or str(version) in {"", "default"}:
+                        raise RuntimeError(f"Inference replica {key} has no published weight version: {version!r}")
                 except Exception:
-                    entry.update(state="FAILED", admission=False)
-                    continue
-                if version is None or str(version) in {"", "default"}:
-                    continue
+                    entry.update(state="FAILED", admission=False, weights_ready=False, initial_weight_probe=False)
+                    observation.registry.invalidate()
+                    logger.exception("Failed to confirm inference weight publication for replica %s", key)
+                    raise
                 entry.update(
                     weights_ready=True, admission=True, weight_version=str(version), initial_weight_probe=False
                 )
@@ -3379,6 +3383,11 @@ class RolloutManager(ReloadableMixin):
         with observation.lock:
             for entry in entries.values():
                 entry.update(weights_ready=False, admission=False, initial_weight_probe=False)
+
+    def _group_has_process_probe(self, group: EngineGroup) -> bool:
+        if getattr(self.args, "rollout_external", False) or group.external_engines:
+            return False
+        return callable(getattr(_resolve_rollout_engine_class(self.args), "health_process", None))
 
     @ray.method(concurrency_group="scale_out")
     def get_inference_snapshot(self) -> dict[str, Any]:
@@ -3420,7 +3429,11 @@ class RolloutManager(ReloadableMixin):
                                 )
                                 observation._refresh_state(entry)
                         replica = observation.replica(
-                            key, workers, direct=False, expected_workers=group.nodes_per_engine
+                            key,
+                            workers,
+                            direct=False,
+                            expected_workers=group.nodes_per_engine,
+                            process_probe=self._group_has_process_probe(group),
                         )
                         if group.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
                             replica.update(state="DRAINING", base_url=None, direct_eligible=False)

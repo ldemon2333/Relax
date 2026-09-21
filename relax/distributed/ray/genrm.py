@@ -11,10 +11,11 @@ import logging
 
 import ray
 
-from relax.backends.sglang.sglang_engine import GenRMEngine
+from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -52,18 +53,18 @@ class GenRMManager(MultiEngineManager):
         self.port_window_index = port_window_index
         self._inference_role = "genrm"
         self._inference_model_id = "__default__"
-        self._inference_served_model_name = (args.genrm_engine_config or {}).get("served_model_name") or (
-            args.genrm_engine_config or {}
-        ).get("model_path", args.genrm_model_path)
-        self._inference_preserves_weights = (args.genrm_engine_config or {}).get(
-            "enable_weights_cpu_backup", True
-        ) is True
+        self._engine_spec = InferenceEngineSpec("genrm")
+        self._genrm_args, self._engine_overrides = build_static_engine_config(args, "genrm")
+        self._inference_served_model_name = (
+            self._engine_overrides.get("served_model_name") or self._engine_overrides["model_path"]
+        )
+        self._inference_preserves_weights = True
 
         super().__init__(
             args,
             num_slots=num_slots,
             nodes_per_engine=nodes_per_engine,
-            engine_actor_cls=GenRMEngine,
+            engine_actor_cls=SGLangEngine,
             skip_init=args.debug_train_only,
             log_prefix="GenRM",
         )
@@ -113,6 +114,18 @@ class GenRMManager(MultiEngineManager):
             gpu_idx += self.args.rollout_num_gpus
 
         return self.pg, False, gpu_idx
+
+    def _engine_ctor_args(self, rank):
+        return self._genrm_args
+
+    def _build_engine_ctor_kwargs(self, rank):
+        return {
+            "engine_spec": self._engine_spec,
+            "num_gpus_per_engine": self.args.genrm_num_gpus_per_engine,
+        }
+
+    def _build_engine_init_kwargs(self, rank, addr_and_ports):
+        return {**addr_and_ports, "skip_dcs_registration": True, "skip_router_registration": True}
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with
