@@ -2455,6 +2455,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--inference-defer-roles",
+                nargs="+",
+                choices=["genrm", "teacher"],
+                default=None,
+                help="Run managed scorers after generation on shared GPUs and commit training data afterward.",
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,
@@ -4279,7 +4286,9 @@ def slime_validate_args(args):
                 f"actor total={actor_total_gpus}."
             )
         elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
-            if not getattr(args, "defer_reward_to_post_process", False):
+            if not getattr(args, "defer_reward_to_post_process", False) and "genrm" not in (
+                getattr(args, "inference_defer_roles", None) or []
+            ):
                 raise ValueError(
                     "Same-GPU co-resident inference is unsupported. Use disjoint split GPUs or explicit GenRM defer."
                 )

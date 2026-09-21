@@ -2509,7 +2509,11 @@ class MegatronTrainRayActor(TrainRayActor):
             post_sync_handles = []
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            if (
+                self.genrm_manager is not None
+                and not getattr(self.args, "defer_reward_to_post_process", False)
+                and "genrm" not in (getattr(self.args, "inference_defer_roles", None) or [])
+            ):
                 # A list of one or more GenRM manager handles (one per instance).
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:

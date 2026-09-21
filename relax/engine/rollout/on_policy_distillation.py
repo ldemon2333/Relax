@@ -254,6 +254,120 @@ class OpdManager:
 
         self._assemble_transfer(sample_list)
 
+    async def prepare(self, samples: Sequence[Sample]) -> None:
+        if self.opsd_worker is not None:
+            results = await asyncio.gather(
+                *[self.opsd_worker.build_teacher_inputs(self.args, sample) for sample in samples],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+
+    async def teacher_prefill(self, samples: Sequence[Sample]) -> list[bool]:
+        active = [sample for sample in samples if not getattr(sample, "remove_sample", False)]
+        for sample in active:
+            sample.teacher_log_probs = None
+            sample.teacher_topk_token_ids = None
+            sample.teacher_topk_log_probs = None
+            sample.teacher_at_student_topk_log_probs = None
+        async with _create_teacher_client_session(self.args) as session:
+            results = await asyncio.gather(
+                *[self._teacher_prefill(sample, session) for sample in active], return_exceptions=True
+            )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        failed = [
+            ordinal
+            for ordinal, (sample, success) in enumerate(zip(active, results, strict=True))
+            if int(sample.response_length or 0) > 0 and not success
+        ]
+        if failed:
+            raise RuntimeError(f"Deferred OPD Teacher fetch failed for sample ordinals {failed}")
+        return results
+
+    async def student_prefill(
+        self, samples: Sequence[Sample], encode_multimodal_inputs: EncodeMultimodalInputs | None = None
+    ) -> None:
+        if self.topk_worker is None or not self.topk_worker.spec.student_at_teacher:
+            return
+        active = [sample for sample in samples if int(sample.response_length or 0) > 0 and not sample.remove_sample]
+        for sample in active:
+            sample.student_at_teacher_topk_log_probs = None
+        async with _create_teacher_client_session(self.args) as session:
+            results = await asyncio.gather(
+                *[self._student_prefill(sample, session, encode_multimodal_inputs) for sample in active],
+                return_exceptions=True,
+            )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        for ordinal, sample in enumerate(active):
+            if sample.student_at_teacher_topk_log_probs is None:
+                raise RuntimeError(f"Deferred OPD student fetch failed for sample ordinal {ordinal}")
+
+    def assemble_validate(self, samples: Sequence[Sample]) -> None:
+        active = []
+        for ordinal, sample in enumerate(samples):
+            response_length = int(sample.response_length or 0)
+            if response_length < 0 or response_length > len(sample.tokens):
+                raise ValueError(f"Deferred OPD sample {ordinal} has invalid response length")
+            mask = getattr(sample, "loss_mask", None)
+            if mask is not None and len(mask) != response_length:
+                raise ValueError(f"Deferred OPD sample {ordinal} has a misaligned loss mask")
+            if response_length == 0 or getattr(sample, "remove_sample", False):
+                if self.sampled_worker is not None:
+                    sample.teacher_log_probs = []
+                else:
+                    for name in self.topk_worker.topk_transfer_fields():
+                        shape = (0,) if name == "opd_topk_ksz" else (0, self.topk_worker.top_k)
+                        dtype = np.int32 if name in {"opd_topk_token_ids", "opd_topk_ksz"} else np.float32
+                        setattr(sample, name, np.empty(shape, dtype=dtype))
+                continue
+            if self.sampled_worker is not None:
+                for name in self.sampled_worker.sampled_transfer_fields():
+                    value = getattr(sample, name, None)
+                    if value is None or np.asarray(value).shape != (response_length,):
+                        raise ValueError(f"Deferred OPD sample {ordinal} is missing aligned {name}")
+                    if not np.isfinite(np.asarray(value)).all():
+                        raise ValueError(f"Deferred OPD sample {ordinal} has nonfinite {name}")
+            else:
+                spec = self.topk_worker.spec
+                required = []
+                if spec.student_self_topk:
+                    required.extend(["student_topk_token_ids", "student_topk_log_probs"])
+                if spec.teacher_self_topk:
+                    required.extend(["teacher_topk_token_ids", "teacher_topk_log_probs"])
+                if spec.teacher_at_student:
+                    required.append("teacher_at_student_topk_log_probs")
+                if spec.student_at_teacher:
+                    required.append("student_at_teacher_topk_log_probs")
+                for name in required:
+                    value = getattr(sample, name, None)
+                    if value is None or np.asarray(value).shape != (response_length, self.topk_worker.top_k):
+                        raise ValueError(f"Deferred OPD sample {ordinal} is missing aligned {name}")
+                    if not np.isfinite(np.asarray(value)).all():
+                        raise ValueError(f"Deferred OPD sample {ordinal} has nonfinite {name}")
+                    if name.endswith("token_ids") and (
+                        not np.issubdtype(np.asarray(value).dtype, np.integer) or (np.asarray(value) < 0).any()
+                    ):
+                        raise ValueError(f"Deferred OPD sample {ordinal} has invalid token IDs")
+                active.append(sample)
+        self._assemble_transfer(active)
+        if self.topk_worker is not None:
+            for ordinal, sample in enumerate(active):
+                expected_shape = np.asarray(sample.opd_topk_token_ids).shape
+                for name in self.topk_worker.topk_transfer_fields():
+                    value = getattr(sample, name, None)
+                    expected = (sample.response_length,) if name == "opd_topk_ksz" else expected_shape
+                    if value is None or np.asarray(value).shape != expected or len(expected_shape) != 2:
+                        raise ValueError(f"Deferred OPD sample {ordinal} has incomplete assembled {name}")
+                if self.topk_worker.spec.name == "union":
+                    lengths = np.asarray(sample.opd_topk_ksz)
+                    if (lengths <= 0).any() or (lengths > expected_shape[1]).any():
+                        raise ValueError(f"Deferred OPD sample {ordinal} has invalid union widths")
+
     async def _post_logprob(
         self,
         session: aiohttp.ClientSession,

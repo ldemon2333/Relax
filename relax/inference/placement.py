@@ -236,8 +236,8 @@ def plan_inference_placement(args: Any) -> InferencePlacementPlan:
         deferred_roles.add("genrm")
     if deferred_roles - {"genrm", "teacher"}:
         raise ValueError("Only GenRM and Teacher can be deferred")
-    if "teacher" in deferred_roles:
-        raise ValueError("Deferred Teacher requires the P5 scoring/commit coordinator")
+    if "teacher" in deferred_roles and not teacher_enabled:
+        raise ValueError("Deferred Teacher requires a managed Teacher model")
     if deferred_roles and not colocate:
         raise ValueError("Deferred inference requires shared synchronous placement")
     if "genrm" in deferred_roles and not genrm_models:

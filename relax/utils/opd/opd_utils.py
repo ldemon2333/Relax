@@ -499,6 +499,8 @@ def append_managed_opd_teacher_offload_handle(handles: list[Any], owner: Any) ->
 
 
 def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> None:
+    if "teacher" in (getattr(getattr(owner, "args", None), "inference_defer_roles", None) or []):
+        return
     teacher_manager = getattr(owner, "teacher_manager", None)
     if teacher_manager is None:
         return
@@ -525,7 +527,13 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
 
     teacher_gpus = args.resource["teacher"][1]
     genrm_gpus = sum(spec["num_gpus"] for spec in getattr(args, "_genrm_instances_resolved", {}).values())
-    if args.rollout_num_gpus + genrm_gpus + teacher_gpus > actor_total_gpus:
+    deferred = set(getattr(args, "inference_defer_roles", None) or [])
+    simultaneous = (
+        args.rollout_num_gpus
+        + (0 if "genrm" in deferred else genrm_gpus)
+        + (0 if "teacher" in deferred else teacher_gpus)
+    )
+    if simultaneous > actor_total_gpus or teacher_gpus > actor_total_gpus or genrm_gpus > actor_total_gpus:
         raise ValueError(
             "Managed OPD teacher colocate requires split bundles where "
             "--rollout-num-gpus + GenRM GPUs + resource['teacher'][1] does not exceed actor total GPUs. "

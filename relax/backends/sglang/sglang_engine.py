@@ -31,6 +31,7 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.inference.admission import AdmissionServer
 from relax.inference.engine_spec import (
     InferenceEngineSpec,
     build_static_engine_config,
@@ -41,7 +42,7 @@ from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
 from relax.utils.env import Envs
-from relax.utils.http_utils import get_host_info, router_worker_base_url
+from relax.utils.http_utils import find_available_port, get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
@@ -377,6 +378,9 @@ class SGLangEngine(RayActor):
         self._router_unregister_submitted = False
         self._resident_tags = {"weights", "kv_cache", "cuda_graph"}
         self._admission_paused = False
+        self._admission_server = None
+        self._strict_admission = bool(getattr(args, "_inference_strict_admission", False))
+        self._resume_generation_requested = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -468,6 +472,16 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        if getattr(self, "_strict_admission", False):
+            if self.args.rollout_external or init_external_kwargs or self.args.fully_async:
+                raise ValueError("Strict admission requires managed synchronous inference engines")
+            self._ingress_host = self.server_host
+            self._ingress_port = self.server_port
+            if self.node_rank == 0:
+                self.server_host = "127.0.0.1"
+                self.server_port = find_available_port(self._ingress_port)
+                server_args_dict["host"] = self.server_host
+                server_args_dict["port"] = self.server_port
 
         # Start the engine first so the server is healthy before we create the
         # DCS client.  Creating the client before the server is ready can cause
@@ -577,6 +591,21 @@ class SGLangEngine(RayActor):
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         self.process = launch_server_process(ServerArgs(**server_args_dict))
+        if getattr(self, "_strict_admission", False) and self.node_rank == 0:
+            try:
+                self._admission_server = AdmissionServer(
+                    f"http://{self.server_host}:{self.server_port}",
+                    self._ingress_host.strip("[]"),
+                    self._ingress_port,
+                )
+                if self.engine_spec is not None:
+                    self._admission_server.gate.open()
+            except BaseException:
+                kill_process_tree(self.process.pid)
+                self.process.join(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                if self.process.is_alive():
+                    raise RuntimeError("Admission startup failed and backend cleanup is unconfirmed")
+                raise
 
         bootstrap_port = (
             server_args_dict.get("disaggregation_bootstrap_port") if self.worker_type == "prefill" else None
@@ -597,7 +626,8 @@ class SGLangEngine(RayActor):
                 bound on paths that must not hang (e.g. colocate offload).
 
         Returns:
-            The JSON response from the server
+            The JSON response from the server, or ``None`` for a successful
+            response with an empty body.
         """
         if self.engine_spec is not None:
             self.engine_spec.require_operation(endpoint)
@@ -610,6 +640,8 @@ class SGLangEngine(RayActor):
         except requests.exceptions.HTTPError as e:
             e.add_note(f"{response.text=}")
             raise
+        if not getattr(response, "content", None):
+            return None
         return response.json()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
@@ -830,6 +862,10 @@ class SGLangEngine(RayActor):
             time.sleep(1)
 
     def shutdown(self):
+        admission = getattr(self, "_admission_server", None)
+        if admission is not None:
+            admission.stop(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            self._admission_server = None
         if getattr(self.args, "rollout_external", False):
             return
         if hasattr(self, "server_host"):
@@ -867,6 +903,8 @@ class SGLangEngine(RayActor):
         engines."""
         if self.node_rank != 0:
             return None
+        if getattr(self, "_strict_admission", False):
+            return f"http://{self._ingress_host}:{self._ingress_port}"
         return f"http://{self.server_host}:{self.server_port}"
 
     def get_pid_and_node_id(self) -> dict:
@@ -886,7 +924,7 @@ class SGLangEngine(RayActor):
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
 
-        worker_url = f"http://{self.server_host}:{self.server_port}"
+        worker_url = self.get_url()
         try:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
@@ -971,7 +1009,7 @@ class SGLangEngine(RayActor):
     def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
-        worker_url = f"http://{self.server_host}:{self.server_port}"
+        worker_url = self.get_url()
         router_version = parse(sglang_router.__version__)
         if self._router_unregister_submitted:
             if not wait_for_removal or router_version < parse("0.3.0"):
@@ -1061,6 +1099,23 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
+        admission = getattr(self, "_admission_server", None)
+        if admission is not None:
+            admission.gate.close()
+            admission.gate.wait_requests_closed(_GENRM_OFFLOAD_DRAIN_TIMEOUT_S)
+            self._resume_generation_requested = bool(
+                getattr(self.args, "_inference_preserve_rollout_weights", False)
+                and getattr(self, "_resume_generation_requested", False)
+            )
+            if self.engine_spec is None:
+                self.pause_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                self._make_request("abort_request", {"abort_all": True}, timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                self.flush_cache()
+                admission.gate.confirm_backend_drained()
+                admission.gate.wait_drained(_GENRM_OFFLOAD_DRAIN_TIMEOUT_S)
+                result = self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
+                self._resident_tags = set()
+                return result
         if self.engine_spec is not None:
             if self.node_rank != 0:
                 return
@@ -1093,6 +1148,9 @@ class SGLangEngine(RayActor):
                 sleep=time.sleep,
             )
             self._resident_tags = set()
+            if admission is not None:
+                admission.gate.confirm_backend_drained()
+                admission.gate.wait_drained(_GENRM_OFFLOAD_DRAIN_TIMEOUT_S)
             return result
         self.flush_cache()
         return self._make_request("release_memory_occupation")
@@ -1109,6 +1167,10 @@ class SGLangEngine(RayActor):
                 self._resident_tags = set()
             self._resident_tags.update(tags or ["weights", "kv_cache", "cuda_graph"])
             if self._resident_tags >= {"weights", "kv_cache", "cuda_graph"}:
+                self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        elif getattr(self, "_strict_admission", False) and self.node_rank == 0:
+            self._resident_tags.update(tags or ["weights", "kv_cache", "cuda_graph"])
+            if self._resume_generation_requested and self._resident_tags >= {"weights", "kv_cache", "cuda_graph"}:
                 self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
         return result
 
@@ -1438,6 +1500,10 @@ class SGLangEngine(RayActor):
             log_directory.cleanup()
 
     def pause_generation(self, timeout: float | None = None):
+        admission = getattr(self, "_admission_server", None)
+        if admission is not None:
+            admission.gate.close()
+            admission.gate.wait_requests_closed(timeout or _SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
         )
@@ -1459,7 +1525,37 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         if self.engine_spec is not None:
             self._admission_paused = False
+        admission = getattr(self, "_admission_server", None)
+        if admission is not None:
+            self._resume_generation_requested = True
+            admission.gate.wait_requests_closed(timeout or _SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            self.flush_cache(timeout_s=timeout or _SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            if not admission.gate.status()["ready"]:
+                admission.gate.confirm_backend_drained()
+            if self._resident_tags >= {"weights", "kv_cache", "cuda_graph"}:
+                admission.gate.open()
         return response
+
+    def close_admission(self, timeout: float = 30.0) -> None:
+        admission = getattr(self, "_admission_server", None)
+        if admission is None:
+            if self.node_rank == 0:
+                raise RuntimeError("Engine does not own a strict inference admission ingress")
+            return
+        admission.gate.close()
+        admission.gate.wait_requests_closed(timeout)
+
+    def open_admission(self) -> None:
+        admission = getattr(self, "_admission_server", None)
+        if admission is None:
+            if self.node_rank == 0:
+                raise RuntimeError("Engine does not own a strict inference admission ingress")
+            return
+        if not self._resident_tags >= {"weights", "kv_cache", "cuda_graph"}:
+            raise RuntimeError("Cannot open inference admission before memory restoration")
+        if self.engine_spec is None and not self._resume_generation_requested:
+            raise RuntimeError("Cannot open dynamic inference before confirmed weight publication")
+        admission.gate.open()
 
     def post_process_weights(
         self,
@@ -1739,6 +1835,11 @@ def _compute_server_args(
                 logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
             kwargs[key] = value
             unused_keys.discard(key)
+
+    if getattr(args, "_inference_preserve_rollout_weights", False):
+        if kwargs.get("enable_weights_cpu_backup") is False:
+            raise ValueError("Deferred rollout requires CPU weight backup for same-version restoration")
+        kwargs["enable_weights_cpu_backup"] = True
 
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names

@@ -75,6 +75,13 @@ class TeacherManager(MultiEngineManager):
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
             required = int(args.rollout_num_gpus) + bundle_offset + gpus_per_replica * num_replicas
+            if getattr(args, "_inference_placement_plan", None) is not None:
+                from relax.inference.placement import model_placement
+
+                placement = model_placement(args, "teacher", getattr(args, "_inference_model_id", "__default__"))
+                if placement is None:
+                    raise ValueError("Teacher is absent from the validated placement plan")
+                required = placement.bundle_stop
             assert len(bundle_indices) >= required and len(gpu_ids) >= required, (
                 f"shared teacher PG too small: bundles={len(bundle_indices)}, "
                 f"gpu_ids={len(gpu_ids)}, required={required} (rollout_num_gpus={args.rollout_num_gpus} + "

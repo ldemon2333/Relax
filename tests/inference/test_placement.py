@@ -151,7 +151,6 @@ def test_placement_explicit_genrm_defer_reuses_rollout_bundles_in_later_phase():
         ({"genrm_num_gpus": 3}, "GenRM resource"),
         ({"teacher_num_gpus_per_engine": 3}, "divide"),
         ({"_genrm_colocate_with_rollout": True}, "Same-phase"),
-        ({"inference_defer_roles": ["teacher"]}, "P5"),
         ({"inference_defer_roles": ["actor"]}, "Only GenRM"),
         ({"fully_async": True}, "hybrid"),
         ({"rollout_external": True}, "External Rollout"),

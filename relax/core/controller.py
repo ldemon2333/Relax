@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import traceback
+import uuid
 from argparse import Namespace
 from enum import Enum, IntEnum
 from functools import partial
@@ -32,7 +33,9 @@ from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group, get_placement_group_topology
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_lifecycle import InferenceLifecycleCoordinator
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
+from relax.inference.defer import validate_deferred_workload
 from relax.inference.placement import plan_inference_placement, validate_bound_placement
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -876,10 +879,13 @@ class Controller:
             self.config._inference_rollout_config = rollout_config
         plan = plan_inference_placement(self.config)
         if plan.mode == "defer":
-            raise NotImplementedError(
-                "Deferred inference placement requires the P5 serial bootstrap and scoring coordinator; "
-                "use decoupled or split placement until that coordinator is enabled"
-            )
+            if not getattr(self.config, "inference_defer_roles", None):
+                raise ValueError(
+                    "Use --inference-defer-roles with a framework scoring adapter; legacy hooks cannot own this plan"
+                )
+            validate_deferred_workload(self.config)
+            self.config._inference_strict_admission = True
+            self.config._inference_preserve_rollout_weights = True
         accelerator = device_utils.get_ray_accelerator_name()
         available = int(ray.cluster_resources().get(accelerator, 0))
         if plan.total_required_gpus > available:
@@ -888,6 +894,11 @@ class Controller:
                 f"GPUs but the cluster has {available}"
             )
         self.config._inference_placement_plan = plan.to_dict()
+        if plan.mode == "defer":
+            self.config._inference_run_id = str(uuid.uuid4())
+            self.config._inference_coordinator = InferenceLifecycleCoordinator.options(
+                **with_control_plane_affinity(self.config)
+            ).remote()
         logger.info(
             f"Inference placement preflight succeeded: required={plan.total_required_gpus}, available={available}"
         )
@@ -959,6 +970,18 @@ class Controller:
                 # (needed for scaled-out engine weight sync in fully_async mode)
                 if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
                     rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
+                    coordinator = getattr(self.config, "_inference_coordinator", None)
+                    if coordinator is not None:
+                        for role in self.config.inference_defer_roles:
+                            if role == "teacher":
+                                managers = (
+                                    self._teacher_manager
+                                    if isinstance(self._teacher_manager, list)
+                                    else [self._teacher_manager]
+                                )
+                            else:
+                                managers = genrm_managers
+                            await coordinator.register.remote(role, managers)
                     await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
                     # Colocate wiring topology:
@@ -1089,6 +1112,10 @@ class Controller:
 
         self._shutdown_teacher_gateway()
         shutdown_managed_opd_teacher(self._teacher_manager)
+        coordinator = getattr(self.config, "_inference_coordinator", None)
+        if coordinator is not None:
+            ray.kill(coordinator)
+            self.config._inference_coordinator = None
 
         self._shutdown_agentic_rollout_services()
 

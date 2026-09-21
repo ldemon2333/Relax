@@ -1135,6 +1135,11 @@ class RolloutManager(ReloadableMixin):
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
+        if getattr(self.args, "inference_defer_roles", None):
+            from relax.inference.defer import run_deferred_rollout
+
+            await asyncio.to_thread(run_deferred_rollout, self, rollout_id)
+            return
         output = await asyncio.to_thread(
             call_rollout_fn,
             self.generate_rollout,
@@ -1276,7 +1281,9 @@ class RolloutManager(ReloadableMixin):
         except Exception:
             observation.failed(observed)
             raise
-        observation.offloaded(observed, preserve_weights=False)
+        observation.offloaded(
+            observed, preserve_weights=getattr(self.args, "_inference_preserve_rollout_weights", False)
+        )
         for entry in observed.values():
             entry["initial_weight_probe"] = False
         self.status = "offload"

@@ -154,8 +154,8 @@ def test_preflight_failure_occurs_before_teacher_datasource_or_pg_start(controll
     with pytest.raises((ValueError, RuntimeError)) as error:
         instance.register_all_serve()
     if failure == "defer_not_enabled":
-        assert isinstance(error.value, NotImplementedError)
-        assert "serial bootstrap" in str(error.value)
+        assert isinstance(error.value, ValueError)
+        assert "--inference-defer-roles" in str(error.value)
 
     teacher.assert_not_called()
     datasource.assert_not_called()
