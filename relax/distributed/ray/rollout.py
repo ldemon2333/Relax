@@ -25,11 +25,13 @@ from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.core.service import get_placement_group_topology
 from relax.distributed.ray.inference_manager import (
+    EngineShutdownGuard,
     InferenceCleanupError,
     InferenceManager,
+    InferenceRecoveryRequired,
     _InferenceObservation,
-    _is_actor_confirmed_dead,
     _model_discovery_state,
+    get_engine_shutdown_guard,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.distributed.ray.rollout_workload import RolloutWorkload
@@ -465,6 +467,7 @@ class EngineGroup:
     eviction_requested: bool = False
     external_engines: bool = False
     replica_urls: dict[int, str] = dataclasses.field(default_factory=dict)
+    _engine_shutdown_guard: EngineShutdownGuard = dataclasses.field(default_factory=EngineShutdownGuard, repr=False)
 
     @property
     def nodes_per_engine(self):
@@ -487,6 +490,7 @@ class EngineGroup:
 
         Placeholder groups (worker_type="placeholder") skip engine creation entirely.
         """
+        get_engine_shutdown_guard(self).require_recovery()
         if port_cursors is None:
             port_cursors = {}
         if self.args.debug_train_only or self.worker_type == "placeholder":
@@ -514,6 +518,8 @@ class EngineGroup:
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
+            if i % self.nodes_per_engine == 0:
+                self.replica_urls.pop(i // self.nodes_per_engine, None)
 
             global_rank = self.rank_offset + i
             num_gpus = 0.2
@@ -628,6 +634,21 @@ class EngineGroup:
         ]
         return init_handles, port_cursors
 
+    def refresh_replica_urls(self, worker_indices: list[int]) -> None:
+        """Record rebuilt heads' published URLs before they can be removed."""
+        if not self.is_scaled_out:
+            return
+        heads = sorted({index for index in worker_indices if index % self.nodes_per_engine == 0})
+        if not heads:
+            return
+        urls = ray.get([self.all_engines[index].get_url.remote() for index in heads], timeout=5.0)
+        updated = {}
+        for index, url in zip(heads, urls, strict=True):
+            if not isinstance(url, str) or not url.strip():
+                raise RuntimeError(f"Recovered head at rank {self.rank_offset + index} published no URL")
+            updated[index // self.nodes_per_engine] = url.removeprefix("http://").removeprefix("https://")
+        self.replica_urls.update(updated)
+
     def offload(self):
         """Fire release_memory_occupation on all engines (non-blocking).
 
@@ -666,12 +687,17 @@ class EngineGroup:
         router and DCS.
         """
         failures = []
+        guard = get_engine_shutdown_guard(self)
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
                 try:
-                    ray.get(engine.shutdown.remote(), timeout=10)
+                    guard.check(engine)
+                    result = ray.get(engine.shutdown.remote(), timeout=10)
+                    if result is False:
+                        raise InferenceCleanupError("Engine rejected shutdown")
                 except Exception as e:
+                    e = guard.failed(engine, e)
                     logger.warning(f"Failed to shutdown engine {i}: {e}")
                     failures.append(i)
                     continue
@@ -692,6 +718,7 @@ class EngineGroup:
             self.all_engines[i] = None
             logger.info(f"Shutdown engine at index {i}")
         if failures:
+            guard.require_recovery()
             raise InferenceCleanupError(f"Worker shutdown remains unconfirmed for indices {failures}")
 
 
@@ -786,6 +813,8 @@ class RolloutServer:
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
         for group in groups:
+            get_engine_shutdown_guard(group).require_recovery()
+        for group in groups:
             if group.is_scaled_out and group.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
                 continue
             if group.nodes_per_engine > 1:
@@ -846,6 +875,11 @@ class RolloutServer:
         if all_handles:
             try:
                 ray.get(all_handles, timeout=900.0)
+                for group, indices in zip(groups, dead_per_group, strict=True):
+                    if group.pg is not None and (
+                        not group.is_scaled_out or group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+                    ):
+                        group.refresh_replica_urls(indices)
             except Exception:
                 for group, indices in zip(groups, dead_per_group, strict=True):
                     group.shutdown_engines(set(indices))
@@ -1120,6 +1154,21 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        with self._engine_lifecycle_lock:
+            self._disposing = True
+            self._get_inference_manager()._stopping = True
+            get_engine_shutdown_guard(self).require_recovery()
+            pending = [
+                request.request_id
+                for request in getattr(self, "_scale_out_requests", {}).values()
+                if not request.is_terminal()
+            ]
+            active = getattr(self, "_active_scale_out", 0)
+        if pending or active:
+            raise InferenceRecoveryRequired(
+                f"Rollout cleanup cannot confirm in-flight provisioning {pending} ({active} active calls); "
+                "node/container cleanup is required before restarting"
+            )
         self._stop_eviction_monitor()
         for monitor in self._health_monitors:
             monitor.stop()
@@ -1720,22 +1769,32 @@ class RolloutManager(ReloadableMixin):
         if request is None:
             logger.error(f"Scale-out request {request_id} not found")
             return
-        if request.status != ScaleOutStatus.PENDING:
-            logger.warning(f"Scale-out request {request_id} is not in PENDING state: {request.status}")
-            return
+        with self._engine_lifecycle_lock:
+            if request.status != ScaleOutStatus.PENDING:
+                logger.warning(f"Scale-out request {request_id} is not in PENDING state: {request.status}")
+                return
+            if getattr(self, "_disposing", False):
+                request.update_status(ScaleOutStatus.FAILED, "Rollout shutdown has started")
+                return
+            request.update_status(ScaleOutStatus.CREATING)
+            self._active_scale_out = getattr(self, "_active_scale_out", 0) + 1
 
-        # Auto-detect mode: if num_replicas > 0, it's ray_native; if engine_urls is provided, it's external
-        if request.num_replicas > 0:
-            await self._scale_out_ray_native(request)
-        elif request.engine_urls:
-            await self._scale_out_external(request)
-        else:
-            request.update_status(
-                ScaleOutStatus.FAILED, "Invalid request: neither num_replicas nor engine_urls provided"
-            )
-            logger.error(
-                f"[ScaleOut] Invalid request {request.request_id}: neither num_replicas nor engine_urls provided"
-            )
+        try:
+            # A cancelled request may still have provisioning calls in flight.
+            if request.num_replicas > 0:
+                await self._scale_out_ray_native(request)
+            elif request.engine_urls:
+                await self._scale_out_external(request)
+            else:
+                request.update_status(
+                    ScaleOutStatus.FAILED, "Invalid request: neither num_replicas nor engine_urls provided"
+                )
+                logger.error(
+                    f"[ScaleOut] Invalid request {request.request_id}: neither num_replicas nor engine_urls provided"
+                )
+        finally:
+            with self._engine_lifecycle_lock:
+                self._active_scale_out -= 1
 
     async def _scale_out_ray_native(self, request: ScaleOutRequest) -> None:
         """Execute scale-out in ray_native mode with incremental resource
@@ -2040,10 +2099,11 @@ class RolloutManager(ReloadableMixin):
             )
 
             # Step 2: Create EngineGroup (skip router registration during init)
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
             new_group = EngineGroup(
                 args=self.args,
                 pg=pg_tuple,
-                all_engines=[None],  # Single engine per replica
+                all_engines=[None] * actors_per_replica,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
                 worker_type="regular",
@@ -3269,6 +3329,7 @@ class RolloutManager(ReloadableMixin):
             engines = engines_or_group.all_engines
         else:
             engines = engines_or_group
+        guard = get_engine_shutdown_guard(engines_or_group if isinstance(engines_or_group, EngineGroup) else self)
 
         failures = []
         for index, engine in enumerate(engines):
@@ -3276,13 +3337,18 @@ class RolloutManager(ReloadableMixin):
                 continue
             try:
                 # Unregister from DCS coordinator
+                guard.check(engine)
                 await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
             except Exception as e:
                 logger.warning(f"Failed to unregister DCS for engine during rollback: {e}")
             try:
                 # Graceful shutdown (unregisters from router + kills sglang process)
-                await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
+                guard.check(engine)
+                result = await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
+                if result is False:
+                    raise InferenceCleanupError("Engine rejected shutdown")
             except Exception as e:
+                e = guard.failed(engine, e)
                 logger.warning(f"Failed to shutdown engine during rollback: {e}")
                 failures.append(index)
                 continue
@@ -3293,6 +3359,7 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"Failed to kill engine actor during rollback: {e}")
                 failures.append(index)
         if failures:
+            guard.require_recovery()
             raise InferenceCleanupError(f"Rollout rollback has unconfirmed engine workers {failures}")
 
     @ray.method(concurrency_group="scale_out")
@@ -4087,6 +4154,8 @@ class RolloutManager(ReloadableMixin):
                 except Exception as e:
                     logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
             with self._engine_lifecycle_lock:
+                if group.all_engines[node0_idx * group.nodes_per_engine] is not head:
+                    return None
                 if url:
                     normalized = self._normalize_engine_addr(url)
                     group.replica_urls[node0_idx] = normalized
@@ -4321,7 +4390,10 @@ class RolloutManager(ReloadableMixin):
         live_actors: list[tuple[int, object]],
         shutdown_timeout: float,
     ) -> None:
+        guard = get_engine_shutdown_guard(group)
+
         async def _shutdown(engine):
+            guard.check(engine)
             return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
         shutdown_results = await asyncio.gather(
@@ -4331,7 +4403,10 @@ class RolloutManager(ReloadableMixin):
         failures = []
         released = []
         for (i, engine), result in zip(live_actors, shutdown_results):
-            if isinstance(result, BaseException) and not _is_actor_confirmed_dead(result):
+            if result is False:
+                result = InferenceCleanupError("Engine rejected shutdown")
+            if isinstance(result, BaseException):
+                result = guard.failed(engine, result)
                 logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
                 failures.append(i)
                 continue
@@ -4346,7 +4421,8 @@ class RolloutManager(ReloadableMixin):
             for i in released:
                 group.all_engines[i] = None
         if failures:
-            raise RuntimeError(f"Engine {engine_id} cleanup is unconfirmed for workers {failures}")
+            guard.require_recovery()
+            raise InferenceCleanupError(f"Engine {engine_id} cleanup is unconfirmed for workers {failures}")
 
     async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
         engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"

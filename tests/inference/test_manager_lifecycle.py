@@ -336,8 +336,9 @@ def test_failed_recovery_does_not_reclassify_untouched_sleeping_replica(runtime)
 
 
 @pytest.mark.parametrize("phase", ["submission", "result"])
-def test_dead_actor_shutdown_releases_slot_for_recovery(runtime, monkeypatch, phase):
-    pool = _Pool(runtime, slots=2, owned=False)
+@pytest.mark.parametrize("owned", [False, True])
+def test_dead_actor_shutdown_fences_recovery_without_repeating_rpc(runtime, monkeypatch, phase, owned):
+    pool = _Pool(runtime, slots=2, owned=owned)
     pool._init_engines([0, 1])
     dead = pool.all_engines[0]
     if phase == "submission":
@@ -352,13 +353,19 @@ def test_dead_actor_shutdown_releases_slot_for_recovery(runtime, monkeypatch, ph
     else:
         runtime.rpc_failures[(0, "shutdown")] = module.ray.exceptions.ActorDiedError()
 
-    pool._retire_engines([0])
+    with pytest.raises(module.InferenceRecoveryRequired, match="node/container"):
+        pool._retire_engines([0])
+    events = list(runtime.events)
     runtime.rpc_failures.clear()
 
-    assert pool.all_engines[0] is None
-    assert not pool._cleanup_pending
-    assert pool.recover() == {0}
-    assert pool.all_engines[0] is not None and pool.all_engines[0] is not dead
+    for _ in range(2):
+        with pytest.raises(module.InferenceRecoveryRequired, match="node/container"):
+            pool.recover()
+    assert runtime.events == events
+    assert pool.all_engines[0] is dead
+    assert pool._cleanup_pending == {0}
+    assert pool._shutdown_confirmed == set()
+    assert runtime.removed == []
 
 
 def test_unavailable_actor_shutdown_remains_unconfirmed(runtime):
@@ -372,6 +379,10 @@ def test_unavailable_actor_shutdown_remains_unconfirmed(runtime):
 
     assert pool.all_engines[0] is engine
     assert pool._cleanup_pending == {0}
+    runtime.rpc_failures.clear()
+    pool._retire_engines([0])
+    assert pool.all_engines == [None]
+    assert not pool._cleanup_pending
 
 
 def test_health_check_covers_followers_and_retires_dead_replica(runtime):
@@ -387,10 +398,12 @@ def test_health_check_covers_followers_and_retires_dead_replica(runtime):
     runtime.rpc_failures[(1, "shutdown")] = module.ray.exceptions.ActorDiedError()
     assert not pool.health_check()
 
-    assert pool.all_engines[:2] == [None, None]
+    assert pool.all_engines[0] is None
+    assert pool.all_engines[1] is not None
     assert pool.all_engines[2:] == survivor
     runtime.rpc_failures.clear()
-    assert pool.recover() == {0, 1}
+    with pytest.raises(module.InferenceRecoveryRequired):
+        pool.recover()
 
 
 def test_health_check_transient_failure_does_not_retire_replica(runtime):
@@ -402,3 +415,29 @@ def test_health_check_transient_failure_does_not_retire_replica(runtime):
     assert not pool.health_check()
 
     assert pool.all_engines == workers
+
+
+def test_shutdown_stops_onload_and_recovery_after_ack(runtime):
+    pool = _Pool(runtime, slots=1)
+    pool._init_engines([0])
+    pool.shutdown()
+    events = list(runtime.events)
+    for operation in (pool.onload, pool.recover, lambda: pool._init_engines([0])):
+        with pytest.raises(module.InferenceRecoveryRequired, match="shutdown has started"):
+            operation()
+    assert runtime.events == events
+    assert pool.all_engines == [None]
+
+
+@pytest.mark.parametrize("codec", ["pickle", "ray"])
+def test_recovery_required_error_preserves_restart_fence_when_serialized(codec):
+    import pickle
+
+    from ray.exceptions import RayError
+
+    error = module.InferenceRecoveryRequired("Node/container cleanup is required")
+    restored = (
+        pickle.loads(pickle.dumps(error)) if codec == "pickle" else RayError.from_bytes(RayError.to_bytes(error))
+    )
+    assert isinstance(restored, module.InferenceRecoveryRequired)
+    assert str(restored) == str(error)

@@ -111,7 +111,7 @@ def teacher_controller(monkeypatch):
 
     instance = object.__new__(controller_module.Controller)
     instance._test_module = controller_module
-    teacher = object()
+    teacher = MagicMock()
     instance.config = SimpleNamespace(
         _managed_opd_teacher_model_ids=("__default__",),
         _relax_control_plane_node_group="stable",
@@ -239,6 +239,8 @@ def test_global_restart_removes_teacher_gateway_before_ray_shutdown(teacher_cont
     instance._metrics_service_enabled = False
     instance._autoscaler_config = None
     delete.side_effect = lambda name: events.append(("delete", name))
+    teacher.shutdown.remote.return_value = "teacher cleanup"
+    monkeypatch.setattr(module.ray, "get", lambda ref, **kwargs: events.append(("cleanup", ref)))
     monkeypatch.setattr(module, "shutdown_managed_opd_teacher", lambda handle: events.append(("engines", handle)))
     monkeypatch.setattr(module, "recovery_load_path", lambda config: None)
     monkeypatch.setattr(module.tq, "close", lambda: None)
@@ -250,4 +252,8 @@ def test_global_restart_removes_teacher_gateway_before_ray_shutdown(teacher_cont
     with pytest.raises(RuntimeError, match="end teardown assertion"):
         instance._run_global_restart()
 
-    assert events[:2] == [("delete", "teacher"), ("engines", teacher)]
+    assert events[:3] == [
+        ("cleanup", "teacher cleanup"),
+        ("delete", "teacher"),
+        ("engines", teacher),
+    ]

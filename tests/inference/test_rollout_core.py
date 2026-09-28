@@ -249,6 +249,24 @@ def test_rollout_core_recovery_never_republishes_rebuilt_weights_as_ready(runtim
     assert entry["state"] != "READY"
 
 
+def test_rollout_core_terminal_shutdown_preserves_fence_across_retries(runtime):
+    owner, _server, group, engines = _owner(runtime)
+    group.pg_owned = True
+    runtime.failures["1", "shutdown"] = module.ray.exceptions.ActorDiedError()
+    with pytest.raises(module.InferenceRecoveryRequired):
+        owner.shutdown_rollout()
+    assert group.all_engines == [None, engines[1], None, None]
+    events = list(runtime.events)
+    runtime.failures.clear()
+    with pytest.raises(module.InferenceRecoveryRequired):
+        owner.shutdown_rollout()
+    with pytest.raises(module.InferenceRecoveryRequired):
+        owner.recover_rollout()
+    assert runtime.events == events
+    assert runtime.removed == []
+    assert owner.servers
+
+
 def test_rollout_core_missing_follower_cannot_acknowledge_complete_offload(runtime):
     owner, _server, group, _engines = _owner(runtime)
     group.all_engines[1] = None

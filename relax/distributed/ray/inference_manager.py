@@ -158,6 +158,44 @@ class InferenceCleanupError(RuntimeError):
     pass
 
 
+class InferenceRecoveryRequired(InferenceCleanupError):
+    """Backend cleanup needs external node/container recovery before reuse."""
+
+
+class EngineShutdownGuard:
+    def __init__(self) -> None:
+        # Retain the handle so Python object IDs cannot be reused while fenced.
+        self._terminal: dict[int, Any] = {}
+
+    def check(self, engine: Any) -> None:
+        if id(engine) in self._terminal:
+            self.require_recovery()
+
+    def failed(self, engine: Any, error: BaseException) -> BaseException:
+        if _is_actor_confirmed_dead(error):
+            self._terminal[id(engine)] = engine
+            return InferenceRecoveryRequired(
+                "Actor terminated but backend cleanup is unconfirmed; resource lease retained. "
+                "Node/container cleanup must be confirmed before a fresh job can reuse these resources."
+            )
+        return error
+
+    def require_recovery(self) -> None:
+        if self._terminal:
+            raise InferenceRecoveryRequired(
+                "Backend cleanup is unconfirmed for terminated actors; resource leases retained. "
+                "Automatic rebuild is disabled; confirm node/container cleanup before starting a fresh job."
+            )
+
+
+def get_engine_shutdown_guard(owner: Any) -> EngineShutdownGuard:
+    guard = getattr(owner, "_engine_shutdown_guard", None)
+    if guard is None:
+        guard = EngineShutdownGuard()
+        owner._engine_shutdown_guard = guard
+    return guard
+
+
 class InferenceManager:
     def __init__(
         self,
@@ -183,6 +221,8 @@ class InferenceManager:
         self._lifecycle_lock = threading.RLock()
         self._cleanup_pending: set[int] = set()
         self._shutdown_confirmed: set[int] = set()
+        self._engine_shutdown_guard = EngineShutdownGuard()
+        self._stopping = False
         self._onloaded = True
         self._inference_observation = _InferenceObservation(getattr(self, "_inference_role", "genrm"))
 
@@ -290,6 +330,11 @@ class InferenceManager:
 
     def _rollout_memory(self, method: str, tags: Optional[list[str]] = None) -> None:
         with self._lifecycle_lock:
+            for server in self.servers.values():
+                for group in server.engine_groups:
+                    get_engine_shutdown_guard(group).require_recovery()
+            if method == "resume_memory_occupation" and self._stopping:
+                raise InferenceRecoveryRequired("Rollout shutdown has started; onload is disabled")
             observation = self._inference_observation
             requested = set(_RESIDENT_TAGS if tags is None else tags)
             if not requested.issubset(_RESIDENT_TAGS):
@@ -363,11 +408,15 @@ class InferenceManager:
 
     def recover_rollout(self, model_name: str | None = None) -> None:
         with self._lifecycle_lock:
+            if self._stopping:
+                raise InferenceRecoveryRequired("Rollout shutdown has started; automatic recovery is disabled")
             server = (
                 self.servers.get(model_name) if model_name is not None else next(iter(self.servers.values()), None)
             )
             if server is None:
                 return
+            for group in server.engine_groups:
+                get_engine_shutdown_guard(group).require_recovery()
             observation = self._inference_observation
             before = observation.begin(self.rollout_replicas(server.model_name), "ONLOADING")
             try:
@@ -384,6 +433,7 @@ class InferenceManager:
 
     def shutdown_rollout(self, timeout: float = _ENGINE_SHUTDOWN_TIMEOUT_S) -> None:
         with self._lifecycle_lock:
+            self._stopping = True
             errors, owned_pgs = [], []
             seen = set()
             refs = []
@@ -395,27 +445,27 @@ class InferenceManager:
                         if engine is None or id(engine) in seen:
                             continue
                         seen.add(id(engine))
+                        guard = get_engine_shutdown_guard(group)
                         try:
+                            guard.check(engine)
                             refs.append((group, index, engine, engine.shutdown.remote()))
                         except Exception as exc:
-                            if _is_actor_confirmed_dead(exc):
-                                refs.append((group, index, engine, None))
-                                continue
-                            errors.append(exc)
+                            errors.append(guard.failed(engine, exc))
             for group, index, engine, ref in refs:
                 try:
-                    if ref is not None:
-                        try:
-                            ray.get(ref, timeout=timeout)
-                        except Exception as exc:
-                            if not _is_actor_confirmed_dead(exc):
-                                raise
+                    result = ray.get(ref, timeout=timeout)
+                    if result is False:
+                        raise InferenceCleanupError("Engine rejected shutdown")
                     ray.kill(engine)
                     group.all_engines[index] = None
                 except Exception as exc:
-                    errors.append(exc)
+                    errors.append(get_engine_shutdown_guard(group).failed(engine, exc))
             if errors:
                 self.status = "failed"
+                self._inference_observation.registry.invalidate()
+                for server in self.servers.values():
+                    for group in server.engine_groups:
+                        get_engine_shutdown_guard(group).require_recovery()
                 raise InferenceCleanupError("Rollout shutdown remains unconfirmed") from errors[0]
 
             for pg in owned_pgs:
@@ -482,6 +532,9 @@ class InferenceManager:
 
     def _init_engines(self, ranks: list[int]) -> int:
         with self._lifecycle_lock:
+            self._engine_shutdown_guard.require_recovery()
+            if self._stopping:
+                raise InferenceRecoveryRequired("Manager shutdown has started; automatic rebuild is disabled")
             if self._cleanup_pending:
                 raise InferenceCleanupError("Cannot initialize engines while prior cleanup is unconfirmed")
             EngineActor = ray.remote(self.engine_actor_cls)
@@ -584,20 +637,19 @@ class InferenceManager:
             if engine is None or rank in self._shutdown_confirmed:
                 continue
             try:
+                self._engine_shutdown_guard.check(engine)
                 shutdown_refs[rank] = engine.shutdown.remote()
             except Exception as exc:
-                if _is_actor_confirmed_dead(exc):
-                    self._shutdown_confirmed.add(rank)
-                    continue
+                exc = self._engine_shutdown_guard.failed(engine, exc)
                 errors.append(f"rank={rank} shutdown submission: {exc}")
         for rank, ref in shutdown_refs.items():
             try:
-                ray.get(ref, timeout=max(0.01, deadline - time.monotonic()))
+                result = ray.get(ref, timeout=max(0.01, deadline - time.monotonic()))
+                if result is False:
+                    raise InferenceCleanupError("Engine rejected shutdown")
                 self._shutdown_confirmed.add(rank)
             except Exception as exc:
-                if _is_actor_confirmed_dead(exc):
-                    self._shutdown_confirmed.add(rank)
-                    continue
+                exc = self._engine_shutdown_guard.failed(self.all_engines[rank], exc)
                 errors.append(f"rank={rank} shutdown: {exc}")
         for rank in ranks:
             engine = self.all_engines[rank]
@@ -619,6 +671,8 @@ class InferenceManager:
             self._cleanup_pending.discard(rank)
         if errors:
             self._inference_observation.failed(observed)
+            self._update_onloaded_state()
+            self._engine_shutdown_guard.require_recovery()
             raise InferenceCleanupError("Cleanup remains unconfirmed: " + "; ".join(errors))
 
     def health_check(self) -> bool:
@@ -670,6 +724,9 @@ class InferenceManager:
         if not requested:
             return
         with self._lifecycle_lock:
+            if self._stopping:
+                raise InferenceRecoveryRequired("Manager shutdown has started; onload is disabled")
+            self._engine_shutdown_guard.require_recovery()
             if self._cleanup_pending:
                 self._cleanup_slots(list(self._cleanup_pending))
             self.recover()
@@ -802,6 +859,9 @@ class InferenceManager:
 
     def recover(self) -> set:
         with self._lifecycle_lock:
+            self._engine_shutdown_guard.require_recovery()
+            if self._stopping:
+                raise InferenceRecoveryRequired("Manager shutdown has started; automatic recovery is disabled")
             if self._cleanup_pending:
                 self._cleanup_slots(list(self._cleanup_pending))
             dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
@@ -831,6 +891,7 @@ class InferenceManager:
 
     def shutdown(self) -> None:
         with self._lifecycle_lock:
+            self._stopping = True
             observed = self._inference_observation.begin(self._inference_replicas(), "STOPPING")
             try:
                 self._cleanup_slots(list(range(len(self.all_engines))))

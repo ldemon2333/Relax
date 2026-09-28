@@ -34,6 +34,7 @@ from relax.core.service import Service, create_placement_group, get_placement_gr
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.inference_lifecycle import InferenceLifecycleCoordinator
+from relax.distributed.ray.inference_manager import InferenceRecoveryRequired
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.inference.defer import validate_deferred_workload
 from relax.inference.placement import plan_inference_placement, validate_bound_placement
@@ -1108,6 +1109,76 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _confirm_inference_cleanup_for_restart(self) -> None:
+        """Fence automatic restart until every owned backend confirms
+        cleanup."""
+        failures: list[str] = []
+
+        def confirm(label: str, manager: Any, method: str = "shutdown") -> None:
+            try:
+                if manager is None:
+                    raise RuntimeError("manager handle is unavailable")
+                result = ray.get(getattr(manager, method).remote(), timeout=180.0)
+                if result is False:
+                    raise RuntimeError("manager rejected backend cleanup")
+            except Exception as exc:
+                failures.append(f"{label}: {exc}")
+
+        if ROLES.rollout in self.serve_dict:
+
+            async def fetch_rollout() -> Any:
+                return await asyncio.wait_for(self.serve_dict[ROLES.rollout].get_rollout_manager(), timeout=30.0)
+
+            try:
+                rollout_manager = run(fetch_rollout())
+            except Exception as exc:
+                failures.append(f"rollout manager discovery: {exc}")
+            else:
+                # dispose also stops the rollout health/eviction monitors.
+                confirm("rollout", rollout_manager, "dispose")
+
+        teacher = getattr(self, "_teacher_manager", None)
+        teachers = teacher if isinstance(teacher, list) else ([teacher] if teacher is not None else [])
+        teacher_ids = getattr(self.config, "_managed_opd_teacher_model_ids", ())
+        if len(teacher_ids) > len(teachers):
+            failures.append("teacher: recorded managed teachers have missing manager handles")
+        for index, manager in enumerate(teachers):
+            confirm(f"teacher[{index}]", manager)
+
+        service = self.serve_dict.get(GENRM_ROLE)
+        managers = getattr(self, "_genrm_shutdown_managers", None)
+        if managers is None:
+            managers = self._genrm_shutdown_managers = {}
+        completed = getattr(self, "_genrm_shutdown_complete", set())
+        configured_keys = tuple((getattr(self.config, "_genrm_instances_resolved", None) or {}).keys())
+        keys = tuple(dict.fromkeys((*configured_keys, *managers)))
+        if service is not None and not keys:
+            failures.append("GenRM: service exists without recorded manager identities")
+        for key in keys:
+            if key in completed:
+                continue
+            manager = managers.get(key)
+            if manager is None and service is not None:
+
+                async def fetch_genrm(route_key: str = key) -> Any:
+                    return await asyncio.wait_for(service.get_genrm_manager(route_key), timeout=30.0)
+
+                try:
+                    manager = managers[key] = run(fetch_genrm())
+                except Exception as exc:
+                    failures.append(f"GenRM[{key}] manager discovery: {exc}")
+                    continue
+            confirm(f"GenRM[{key}]", manager)
+
+        if failures:
+            raise InferenceRecoveryRequired(
+                "Automatic restart is fenced because inference backend cleanup is unconfirmed: "
+                + "; ".join(failures)
+                + ". An operator must confirm process cleanup on the affected nodes or replace the affected "
+                "containers/nodes before starting a new full training run. Ray shutdown and a fixed wait "
+                "do not confirm backend resource release."
+            )
+
     def _shutdown_genrm_managers(self) -> None:
         service = self.serve_dict.get(GENRM_ROLE)
         managers = getattr(self, "_genrm_shutdown_managers", None)
@@ -1332,10 +1403,10 @@ class Controller:
         Phase 1 — Teardown:
           1. Stop health management to prevent further callbacks
           2. Cancel pending ObjectRefs to unblock the main thread
-          3. Tear down all existing Ray Serve deployments (services + metrics + DCS)
+          3. Confirm inference backend cleanup before tearing down deployments
           4. Tear down data system (storage units + controller)
           5. Stop the async event loop (prevents C++ crash on ObjectRefStream)
-          6. Shutdown Ray Serve and Ray completely
+          6. Shutdown Ray Serve and disconnect the Ray driver
           7. Re-initialize Ray and Ray Serve
 
         Phase 2 — Re-initialize:
@@ -1402,6 +1473,7 @@ class Controller:
         # the workers.  Without this, the main thread stays blocked on stale
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
+        self._confirm_inference_cleanup_for_restart()
         self._shutdown_teacher_gateway()
         shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
         self._shutdown_genrm_managers()
@@ -1484,7 +1556,7 @@ class Controller:
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to terminate router: {e}")
 
-        # --- 1.10 Shutdown Ray Serve and Ray to kill all processes ---
+        # --- 1.10 Shutdown Ray Serve and disconnect the driver ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -1506,9 +1578,10 @@ class Controller:
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to shutdown Ray: {e}")
 
-        # Wait for all processes to fully terminate
+        # Allow control-plane teardown to settle. Backend cleanup was already
+        # confirmed above; elapsed time is not evidence of resource release.
         time.sleep(5)
-        logger.info("[Global Restart] Waited 5s for resource release")
+        logger.info("[Global Restart] Waited 5s for control-plane teardown")
 
         # --- 1.11 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
