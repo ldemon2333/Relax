@@ -10,6 +10,7 @@ from relax.distributed.ray.inference_lifecycle import (
     InferenceBatchError,
     InferenceLifecycleError,
     LifecycleCoordinatorState,
+    RoleState,
 )
 
 
@@ -44,21 +45,27 @@ class _Manager:
 @pytest.mark.asyncio
 async def test_rollout_and_scoring_leases_are_exclusive_until_offload_acknowledges() -> None:
     coordinator = LifecycleCoordinatorState()
+    assert coordinator._roles == {"rollout": RoleState.SLEEPING}
     genrm, teacher = _Manager(), _Manager()
     await coordinator.register("genrm", [genrm])
     await coordinator.register("teacher", [teacher])
+    assert all(type(state) is RoleState for state in coordinator._roles.values())
     await coordinator.begin_batch(0)
+    assert coordinator._roles["rollout"] is RoleState.ACTIVE
 
     with pytest.raises(InferenceLifecycleError, match="leases held by rollout"):
         await coordinator.activate("teacher", "teacher-on")
     assert not teacher.calls
     await coordinator.acknowledge_rollout_offloaded(0)
+    assert coordinator._roles["rollout"] is RoleState.SLEEPING
     await coordinator.activate("genrm", "genrm-on")
+    assert coordinator._roles["genrm"] is RoleState.ACTIVE
     with pytest.raises(InferenceLifecycleError, match="leases held by genrm"):
         await coordinator.activate("teacher", "teacher-on")
     with pytest.raises(InferenceLifecycleError, match="before inference offload"):
         await coordinator.commit_batch(0)
     await coordinator.deactivate("genrm", "genrm-off")
+    assert coordinator._roles["genrm"] is RoleState.SLEEPING
     await coordinator.activate("teacher", "teacher-on")
     await coordinator.deactivate("teacher", "teacher-off")
     await coordinator.commit_batch(0)
@@ -79,8 +86,11 @@ async def test_concurrent_duplicate_operation_joins_one_manager_rpc() -> None:
     second = asyncio.create_task(coordinator.activate("teacher", "on"))
     await teacher.started["onload"].wait()
     assert teacher.calls == ["onload"]
-    assert (await coordinator.get_state())["roles"]["teacher"] == "ONLOADING"
-    with pytest.raises(InferenceLifecycleError, match="ONLOADING"):
+    assert coordinator._roles["teacher"] is RoleState.ONLOADING
+    snapshot = await coordinator.get_state()
+    assert type(snapshot["roles"]["teacher"]) is str
+    assert snapshot["roles"]["teacher"] == RoleState.ONLOADING.value
+    with pytest.raises(InferenceLifecycleError, match="Cannot offload teacher in ONLOADING; lease remains reserved"):
         await coordinator.deactivate("teacher", "off")
     teacher.gates["onload"].set()
     await asyncio.gather(first, second)
@@ -149,6 +159,7 @@ async def test_manager_failure_retains_lease_and_fails_current_and_future_batch_
         with pytest.raises(InferenceLifecycleError, match="lease retained"):
             await operation("teacher", "failure")
     assert teacher.calls.count(method) == 1
+    assert coordinator._roles["teacher"] is RoleState.BLOCKED
     assert (await coordinator.get_state())["roles"]["teacher"] == "BLOCKED"
     for waiter in waiters:
         with pytest.raises(InferenceBatchError, match="manager response lost"):

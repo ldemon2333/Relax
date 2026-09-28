@@ -8,6 +8,7 @@ import math
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import ray
@@ -17,6 +18,14 @@ from relax.inference.specs import INFERENCE_ROLES
 
 _COMMITTED_HISTORY_LIMIT = 1024
 _OPERATION_HISTORY_LIMIT = 8192
+
+
+class RoleState(str, Enum):
+    SLEEPING = "SLEEPING"
+    ACTIVE = "ACTIVE"
+    ONLOADING = "ONLOADING"
+    DRAINING = "DRAINING"
+    BLOCKED = "BLOCKED"
 
 
 class InferenceLifecycleError(RuntimeError):
@@ -47,7 +56,7 @@ class LifecycleCoordinatorState:
         self._operation_timeout = operation_timeout
         self._condition = asyncio.Condition()
         self._managers: dict[str, tuple[Any, ...]] = {}
-        self._roles: dict[str, str] = {"rollout": "SLEEPING"}
+        self._roles: dict[str, RoleState] = {"rollout": RoleState.SLEEPING}
         self._batches: dict[int | str, _Batch] = {}
         self._current: int | str | None = None
         self._failure: str | None = None
@@ -118,7 +127,7 @@ class LifecycleCoordinatorState:
             if self._batches:
                 raise InferenceLifecycleError("Register every role before the first batch")
             self._managers[role] = handles
-            self._roles[role] = "SLEEPING"
+            self._roles[role] = RoleState.SLEEPING
 
     async def begin_batch(self, rollout_id: int | str) -> None:
         self._validate_batch_id(rollout_id)
@@ -134,12 +143,12 @@ class LifecycleCoordinatorState:
                 raise InferenceBatchError(self._failure)
             if self._current is not None and self._batches[self._current].state != "COMMITTED":
                 raise InferenceLifecycleError("Only one pending closed batch may own the shared GPUs")
-            if any(state != "SLEEPING" for state in self._roles.values()):
+            if any(state != RoleState.SLEEPING for state in self._roles.values()):
                 raise InferenceLifecycleError("Previous inference occupants have not released their leases")
             self._evict_committed()
             self._batches[rollout_id] = _Batch()
             self._current = rollout_id
-            self._roles["rollout"] = "ACTIVE"
+            self._roles["rollout"] = RoleState.ACTIVE
             self._condition.notify_all()
 
     async def activate(self, role: str, operation_id: str) -> None:
@@ -168,16 +177,18 @@ class LifecycleCoordinatorState:
                 if role not in self._managers:
                     raise InferenceLifecycleError(f"No managers registered for {role!r}")
                 state = self._roles[role]
-                if state not in {"SLEEPING", "ACTIVE"}:
-                    raise InferenceLifecycleError(f"Cannot {method} {role} in {state}; lease remains reserved")
+                if state not in {RoleState.SLEEPING, RoleState.ACTIVE}:
+                    raise InferenceLifecycleError(f"Cannot {method} {role} in {state.value}; lease remains reserved")
                 if method == "onload":
-                    conflicts = [name for name, value in self._roles.items() if name != role and value != "SLEEPING"]
+                    conflicts = [
+                        name for name, value in self._roles.items() if name != role and value != RoleState.SLEEPING
+                    ]
                     if conflicts:
                         raise InferenceLifecycleError(f"Cannot activate {role}; leases held by {', '.join(conflicts)}")
-                target = "ACTIVE" if method == "onload" else "SLEEPING"
+                target = RoleState.ACTIVE if method == "onload" else RoleState.SLEEPING
                 already_done = state == target
                 if not already_done:
-                    self._roles[role] = "ONLOADING" if method == "onload" else "DRAINING"
+                    self._roles[role] = RoleState.ONLOADING if method == "onload" else RoleState.DRAINING
                 task = asyncio.create_task(self._transition(self._current, role, method, already_done))
                 task.add_done_callback(_consume_result)
                 self._operations[operation_id] = (fingerprint, task)
@@ -200,11 +211,11 @@ class LifecycleCoordinatorState:
             detail = str(exc) or type(exc).__name__
             message = f"{role} {method} failed; lease retained: {detail}"
             async with self._condition:
-                self._roles[role] = "BLOCKED"
+                self._roles[role] = RoleState.BLOCKED
                 self._fail(rollout_id, message)
             raise InferenceLifecycleError(message) from exc
         async with self._condition:
-            self._roles[role] = "ACTIVE" if method == "onload" else "SLEEPING"
+            self._roles[role] = RoleState.ACTIVE if method == "onload" else RoleState.SLEEPING
             self._condition.notify_all()
 
     async def acknowledge_rollout_offloaded(self, rollout_id: int | str) -> None:
@@ -213,9 +224,9 @@ class LifecycleCoordinatorState:
             batch = self._current_batch(rollout_id, allow_failed=True)
             if batch.rollout_released:
                 return
-            if self._roles["rollout"] not in {"ACTIVE", "SLEEPING"}:
+            if self._roles["rollout"] not in {RoleState.ACTIVE, RoleState.SLEEPING}:
                 raise InferenceLifecycleError("Cannot acknowledge an uncertain rollout transition")
-            self._roles["rollout"] = "SLEEPING"
+            self._roles["rollout"] = RoleState.SLEEPING
             batch.rollout_released = True
             self._condition.notify_all()
 
@@ -225,11 +236,11 @@ class LifecycleCoordinatorState:
             batch = self._current_batch(rollout_id)
             if batch.student_scoring_started:
                 return
-            if not batch.rollout_released or any(state != "SLEEPING" for state in self._roles.values()):
+            if not batch.rollout_released or any(state != RoleState.SLEEPING for state in self._roles.values()):
                 raise InferenceLifecycleError("Student scoring requires every inference role to be sleeping")
             batch.student_scoring_started = True
             batch.rollout_released = False
-            self._roles["rollout"] = "ACTIVE"
+            self._roles["rollout"] = RoleState.ACTIVE
             self._condition.notify_all()
 
     async def commit_batch(self, rollout_id: int | str) -> None:
@@ -239,7 +250,7 @@ class LifecycleCoordinatorState:
             if (batch is not None and batch.state == "COMMITTED") or rollout_id in self._committed:
                 return
             batch = self._current_batch(rollout_id)
-            occupants = [role for role, state in self._roles.items() if state != "SLEEPING"]
+            occupants = [role for role, state in self._roles.items() if state != RoleState.SLEEPING]
             if occupants:
                 raise InferenceLifecycleError(f"Cannot commit before inference offload: {', '.join(occupants)}")
             batch.state = "COMMITTED"
@@ -278,7 +289,7 @@ class LifecycleCoordinatorState:
                 "rollout_id": self._current,
                 "batch_state": batch.state if batch is not None else None,
                 "error": self._failure,
-                "roles": dict(self._roles),
+                "roles": {role: state.value for role, state in self._roles.items()},
             }
 
 
