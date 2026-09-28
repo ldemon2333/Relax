@@ -257,6 +257,23 @@ async def test_deferred_score_and_publish_orders_release_conversion_and_commit(s
     assert collector.finalized is True
 
 
+@pytest.mark.parametrize("capacity", [1, 2])
+async def test_deferred_score_and_publish_uses_collector_capacity(score_environment, capacity):
+    manager, events = score_environment
+    collector = DeferredTransferCollector(9, groups=[[_sample(1), _sample(2)]], max_samples=capacity)
+    collector.register_finalize(lambda _samples: None)
+
+    if capacity == 1:
+        with pytest.raises(ValueError, match="sample capacity"):
+            await _score_and_publish(manager, collector)
+        assert events == []
+        assert collector.finalized is False
+    else:
+        await _score_and_publish(manager, collector)
+        assert collector.finalized is True
+        assert [name for name, _value in events][-1] == "commit_batch"
+
+
 async def test_deferred_tq_failure_does_not_emit_success_telemetry(score_environment):
     manager, events = score_environment
     collector = DeferredTransferCollector(10, groups=[[_sample(1)]])

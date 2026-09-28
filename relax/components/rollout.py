@@ -92,13 +92,6 @@ class ScaleOutStatusResponse(BaseModel):
     failure_categories: List[str] = Field(default_factory=list)
 
 
-class EnginesInfoResponse(BaseModel):
-    """Response model for engines info."""
-
-    models: dict  # pyright: ignore[reportMissingTypeArgument]
-    total_engines: int
-
-
 class CancelResponse(BaseModel):
     """Response model for cancel operation."""
 

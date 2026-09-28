@@ -52,6 +52,7 @@ def test_registry_snapshots_are_deeply_isolated_and_json_roundtrip():
     immutable = validate_snapshot(json.loads(json.dumps(snapshot)))
 
     assert immutable.to_dict() == snapshot
+    assert set(snapshot) == {"schema_version", "role", "registry_epoch", "topology_revision", "routing", "models"}
     with pytest.raises(FrozenInstanceError):
         immutable.role = "teacher"
     with pytest.raises(TypeError):
@@ -77,7 +78,7 @@ def test_specs_copy_mutable_inputs_before_publication():
     assert routing.route_key_map == {"math": "policy"}
 
 
-def test_registry_revision_changes_for_endpoint_state_generation_routing_and_phase():
+def test_registry_revision_changes_for_endpoint_state_generation_and_routing():
     registry = InferenceRegistry("rollout")
     assert registry.snapshot()["topology_revision"] == 0
     model = _model()
@@ -92,10 +93,6 @@ def test_registry_revision_changes_for_endpoint_state_generation_routing_and_pha
     assert registry.publish([model], routing)["topology_revision"] == 4
     routing = replace(routing, policy_revision=1)
     assert registry.publish([model], routing)["topology_revision"] == 5
-    snapshot = registry.publish([model], routing, phase_epoch=1, phase="training")
-    assert snapshot["topology_revision"] == 6
-    assert snapshot["phase_epoch"] == 1
-    assert snapshot["phase"] == "training"
 
 
 def test_registry_equivalent_candidate_order_does_not_change_revision():

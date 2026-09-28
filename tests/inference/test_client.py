@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from relax.inference.client import InferenceClient, endpoint_url
-from relax.inference.compat import RoleDiscovery, public_legacy_discovery, teacher_base_url
+from relax.inference.compat import RoleDiscovery, public_legacy_discovery
 from relax.inference.registry import InferenceRegistry
 from relax.inference.routing import InferenceRoutingError
 from relax.inference.specs import ModelSnapshot, ReplicaSnapshot, RoutingSpec
@@ -297,13 +297,6 @@ async def test_role_discovery_preserves_lifecycle_revision_between_reads():
     after = await discovery.snapshot()
     assert before["models"] == after["models"]
     assert after["topology_revision"] > before["topology_revision"]
-
-
-@pytest.mark.parametrize(
-    "url", ["http://teacher.example/generate", "http://teacher.example/generate/", "http://teacher.example"]
-)
-def test_teacher_url_adapter_preserves_legacy_generate_urls(url):
-    assert teacher_base_url(url) == "http://teacher.example"
 
 
 def test_endpoint_url_does_not_accept_an_absolute_redirect_path():

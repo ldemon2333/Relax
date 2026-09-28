@@ -226,7 +226,9 @@ async def _score_and_publish(manager: Any, collector: DeferredTransferCollector)
     if "teacher" in roles:
         opd = OpdManager(args)
     batch = DeferredBatch(
-        getattr(args, "_inference_run_id", "current-run"), timeout=float(getattr(args, "rollout_http_timeout", 1800))
+        getattr(args, "_inference_run_id", "current-run"),
+        max_samples=collector.max_samples,
+        timeout=float(getattr(args, "rollout_http_timeout", 1800)),
     )
 
     async def offload_rollout():

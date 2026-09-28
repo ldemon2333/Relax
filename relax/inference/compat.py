@@ -7,20 +7,9 @@ import asyncio
 import copy
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 from relax.inference.registry import InferenceRegistry
 from relax.inference.specs import ModelSnapshot, RegistrySnapshot, RoutingSpec
-
-
-def teacher_base_url(url: str) -> str:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.query or parsed.fragment:
-        raise ValueError("Teacher endpoint must be an HTTP(S) base URL or /generate URL")
-    path = parsed.path.rstrip("/")
-    if path.endswith("/generate"):
-        path = path[: -len("/generate")]
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
 def public_legacy_discovery(diagnostics: dict[str, Any]) -> dict[str, Any]:
@@ -51,7 +40,7 @@ class RoleDiscovery:
         self.timeout = timeout
         self.registry = InferenceRegistry(role)
         self._lock = asyncio.Lock()
-        self._source_revisions: dict[str, tuple[str, int, int] | None] = {}
+        self._source_revisions: dict[str, tuple[str, int] | None] = {}
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
@@ -73,7 +62,7 @@ class RoleDiscovery:
                     models.append(ModelSnapshot(model_id, "FAILED", "DIRECT"))
                     continue
                 parsed = RegistrySnapshot.from_dict(result)
-                source_revisions[model_id] = (parsed.registry_epoch, parsed.topology_revision, parsed.phase_epoch)
+                source_revisions[model_id] = (parsed.registry_epoch, parsed.topology_revision)
                 if parsed.role != self.role or len(parsed.models) != 1:
                     raise ValueError("Legacy static manager must publish one model of the expected role")
                 model = next(iter(parsed.models.values()))

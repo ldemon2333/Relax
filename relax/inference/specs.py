@@ -245,16 +245,11 @@ class RegistrySnapshot:
     topology_revision: int
     models: Mapping[str, ModelSnapshot]
     routing: RoutingSpec = field(default_factory=RoutingSpec)
-    phase_epoch: int = 0
-    phase: str | None = None
 
     def __post_init__(self) -> None:
         _choice(self.role, INFERENCE_ROLES, "role")
         _text(self.registry_epoch, "registry_epoch")
         _integer(self.topology_revision, "topology_revision")
-        _integer(self.phase_epoch, "phase_epoch")
-        if self.phase is not None:
-            _text(self.phase, "phase")
         if not isinstance(self.routing, RoutingSpec):
             raise ValueError("routing must be a RoutingSpec")
         models = dict(_mapping(self.models, "models"))
@@ -278,8 +273,6 @@ class RegistrySnapshot:
             "role": self.role,
             "registry_epoch": self.registry_epoch,
             "topology_revision": self.topology_revision,
-            "phase_epoch": self.phase_epoch,
-            "phase": self.phase,
             "routing": self.routing.to_dict(),
             "models": {model_id: model.to_dict() for model_id, model in self.models.items()},
         }
@@ -293,8 +286,6 @@ class RegistrySnapshot:
                 "role",
                 "registry_epoch",
                 "topology_revision",
-                "phase_epoch",
-                "phase",
                 "routing",
                 "models",
             },

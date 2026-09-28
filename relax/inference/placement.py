@@ -210,6 +210,18 @@ def _genrm_models(args: Any) -> dict[str, dict]:
     }
 
 
+def genrm_ray_gpu_fraction(args: Any) -> float:
+    """Resolve the persistent Ray reservation shared by preflight and GenRM
+    actors."""
+    default = 0.1 if getattr(args, "_genrm_colocate_with_rollout", False) else 0.2
+    fraction = getattr(args, "genrm_ray_num_gpus", default)
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction):
+        raise ValueError("genrm_ray_num_gpus must be a finite nonnegative number")
+    if fraction < 0:
+        raise ValueError("genrm_ray_num_gpus must be nonnegative")
+    return float(fraction)
+
+
 def _validate_persistent_ray_reservations(
     args: Any, placements: Sequence[InferencePlacement], training: Mapping[str, int], *, colocate: bool
 ) -> None:
@@ -230,12 +242,7 @@ def _validate_persistent_ray_reservations(
             continue
         fraction = 0.2
         if placement.role == "genrm":
-            default = 0.1 if getattr(args, "_genrm_colocate_with_rollout", False) else 0.2
-            fraction = getattr(args, "genrm_ray_num_gpus", default)
-            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction):
-                raise ValueError("genrm_ray_num_gpus must be a finite nonnegative number")
-            if fraction < 0:
-                raise ValueError("genrm_ray_num_gpus must be nonnegative")
+            fraction = genrm_ray_gpu_fraction(args)
         local_gpus = min(placement.gpus_per_engine, placement.num_gpus_per_node)
         for index in range(placement.bundle_start, placement.bundle_stop, local_gpus):
             reserve(placement.pool, index, f"{placement.role}/{placement.model_id}", fraction)

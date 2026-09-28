@@ -17,7 +17,7 @@ from relax.core.service import get_placement_group_topology
 from relax.distributed.ray.inference_manager import InferenceManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
-from relax.inference.placement import model_placement, validate_bound_placement
+from relax.inference.placement import genrm_ray_gpu_fraction, model_placement, validate_bound_placement
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
 
@@ -137,12 +137,7 @@ class GenRMManager(InferenceManager):
         return {**addr_and_ports, "skip_dcs_registration": True, "skip_router_registration": True}
 
     def _ray_resource_kwargs(self, rank):
-        # Lower default fractional-GPU footprint when sharing bundles with
-        # rollout (rollout uses 0.2 per actor; 0.2 + 0.2 risks Ray scheduler
-        # rejection).
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
-        num_gpus = getattr(self.args, "genrm_ray_num_gpus", default_ray_num_gpus)
+        num_gpus = genrm_ray_gpu_fraction(self.args)
         return {"num_cpus": num_gpus, "num_gpus": num_gpus}
 
     def _build_engine_env_vars(self):

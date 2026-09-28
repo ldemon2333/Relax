@@ -21,9 +21,6 @@ class InferenceRegistry:
         self,
         models: Iterable[ModelSnapshot] | Mapping[str, ModelSnapshot | Mapping[str, Any]],
         routing: RoutingSpec | Mapping[str, Any] | None = None,
-        *,
-        phase_epoch: int = 0,
-        phase: str | None = None,
     ) -> dict[str, Any]:
         if isinstance(models, Mapping):
             normalized = {
@@ -48,8 +45,6 @@ class InferenceRegistry:
                 topology_revision=current.topology_revision,
                 models=normalized,
                 routing=routing if routing is not None else current.routing,
-                phase_epoch=phase_epoch,
-                phase=phase,
             )
             if candidate != current:
                 self._snapshot = replace(candidate, topology_revision=current.topology_revision + 1)

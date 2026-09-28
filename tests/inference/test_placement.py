@@ -2,9 +2,12 @@
 
 
 import copy
+import importlib.util
 import json
+import sys
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -187,6 +190,66 @@ def test_ppo_split_keeps_persistent_inference_heads_disjoint():
 def test_invalid_genrm_ray_fraction_rejected_before_resource_creation(fraction):
     with pytest.raises(ValueError, match="genrm_ray_num_gpus"):
         plan_inference_placement(_args(genrm_ray_num_gpus=fraction))
+
+
+@pytest.fixture
+def genrm_manager_class(monkeypatch):
+    # Only the GPU engine dependency is replaced; placement and the manager's
+    # resource method are the production implementations.
+    engine_module = ModuleType("relax.backends.sglang.sglang_engine")
+    engine_module.SGLangEngine = object
+    monkeypatch.setitem(sys.modules, engine_module.__name__, engine_module)
+    path = Path(__file__).resolve().parents[2] / "relax/distributed/ray/genrm.py"
+    spec = importlib.util.spec_from_file_location("_test_genrm_ray_resources", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module.GenRMManager.__ray_metadata__.modified_class
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, 0.2),
+        ({"_genrm_colocate_with_rollout": True}, 0.1),
+        ({"genrm_ray_num_gpus": 0.15}, 0.15),
+        ({"_genrm_colocate_with_rollout": True, "genrm_ray_num_gpus": 0.15}, 0.15),
+        ({"genrm_ray_num_gpus": 0}, 0.0),
+    ],
+)
+def test_genrm_manager_resources_match_preflight_reservations(genrm_manager_class, overrides, expected):
+    args = _args(
+        resource={"actor": [1, 8], "critic": [1, 8], "rollout": [1, 8], "genrm": [1, 8]},
+        rollout_num_gpus=8,
+        genrm_num_gpus=8,
+        use_opd=False,
+        inference_defer_roles=["genrm"],
+        **overrides,
+    )
+    manager = object.__new__(genrm_manager_class)
+    manager.args = args
+    resources = manager._ray_resource_kwargs(0)
+    assert resources == {"num_cpus": expected, "num_gpus": expected}
+
+    # Actor, Critic and Rollout fill the shared bundle. Any positive GenRM
+    # reservation must be rejected, with the exact execution-side claim.
+    if expected:
+        with pytest.raises(ValueError, match="Persistent Ray GPU reservations") as error:
+            plan_inference_placement(args)
+        assert f"genrm/__default__={resources['num_gpus']:g})." in str(error.value)
+    else:
+        assert plan_inference_placement(args).mode == "defer"
+
+
+@pytest.mark.parametrize("fraction", [-0.1, float("inf"), float("nan"), True, None, "0.2"])
+def test_genrm_manager_and_preflight_reject_invalid_reservations(genrm_manager_class, fraction):
+    manager = object.__new__(genrm_manager_class)
+    manager.args = _args(genrm_ray_num_gpus=fraction)
+    with pytest.raises(ValueError, match="genrm_ray_num_gpus") as execution_error:
+        manager._ray_resource_kwargs(0)
+    with pytest.raises(ValueError, match="genrm_ray_num_gpus") as preflight_error:
+        plan_inference_placement(manager.args)
+    assert str(execution_error.value) == str(preflight_error.value)
 
 
 @pytest.mark.parametrize(
