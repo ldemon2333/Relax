@@ -15,6 +15,7 @@ from relax.engine.rewards.dapo_genrm import async_compute_score_genrm
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.engine.rollout.deferred_scoring import DeferredBatch
 from relax.engine.rollout.on_policy_distillation import OpdManager
+from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.async_utils import run
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import build_rollout_custom_meta, convert_samples_to_train_data
@@ -53,7 +54,7 @@ def validate_deferred_workload(args: Any) -> None:
     ):
         if getattr(args, name, None):
             raise ValueError(f"Deferred scoring requires an explicit stage adapter for {name}")
-    if getattr(args, "loss_type", None) == "sft":
+    if is_offline_mode(args):
         raise ValueError("Deferred scoring requires an RL workload")
     if getattr(args, "train_backend", "megatron") != "megatron":
         raise ValueError("Deferred scoring currently requires the Megatron phase adapter")

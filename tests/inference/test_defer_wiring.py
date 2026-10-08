@@ -152,7 +152,6 @@ def test_deferred_finalize_registration_requires_managed_batch():
         {"custom_convert_samples_to_train_data_path": "hook"},
         {"agentic_custom_advantage_path": "hook"},
         {"train_backend": "fsdp"},
-        {"loss_type": "sft"},
         {"use_opd": False},
         {"opd_type": "megatron"},
         {"eval_interval": 2, "eval_prompt_data": ["data"]},
@@ -163,6 +162,12 @@ def test_deferred_finalize_registration_requires_managed_batch():
 def test_deferred_preflight_rejects_unsupported_business_dependencies(overrides):
     with pytest.raises(ValueError):
         validate_deferred_workload(_args(**overrides))
+
+
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_deferred_preflight_rejects_offline_workloads(loss_type):
+    with pytest.raises(ValueError, match="requires an RL workload"):
+        validate_deferred_workload(_args(loss_type=loss_type))
 
 
 def test_deferred_preflight_accepts_supported_native_agentic_and_genrm_adapters():
