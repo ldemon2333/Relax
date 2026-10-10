@@ -181,6 +181,15 @@ def test_deferred_preflight_accepts_supported_native_agentic_and_genrm_adapters(
             use_opd=False,
         )
     )
+    with pytest.raises(ValueError, match="supports deferred execution"):
+        validate_deferred_workload(
+            _args(
+                inference_defer_roles=["genrm"],
+                _genrm_instances_resolved={"judge": {}},
+                rm_type="remote_rm",
+                use_opd=False,
+            )
+        )
     with pytest.raises(ValueError, match="one model"):
         validate_deferred_workload(
             _args(
@@ -190,6 +199,20 @@ def test_deferred_preflight_accepts_supported_native_agentic_and_genrm_adapters(
                 use_opd=False,
             )
         )
+
+
+def test_deferred_preflight_accepts_registered_deferred_reward_capability(monkeypatch):
+    reward_spec = SimpleNamespace(mode="async", supports_deferred=True)
+    monkeypatch.setattr(defer_module, "get_reward_spec", lambda name: reward_spec if name == "judge-rm" else None)
+
+    validate_deferred_workload(
+        _args(
+            inference_defer_roles=["genrm"],
+            _genrm_instances_resolved={"judge": {}},
+            rm_type="judge-rm",
+            use_opd=False,
+        )
+    )
 
 
 @pytest.fixture
@@ -405,6 +428,7 @@ async def test_training_commit_wait_uses_coordinator_and_rejects_missing_gate():
 async def test_deferred_reward_exception_waits_for_sibling_before_role_release(score_environment, monkeypatch):
     manager, events = score_environment
     manager.args.inference_defer_roles = ["genrm"]
+    manager.args.rm_type = "judge-rm"
     completed = asyncio.Event()
 
     async def score(args, sample):
@@ -416,7 +440,11 @@ async def test_deferred_reward_exception_waits_for_sibling_before_role_release(s
         completed.set()
         return {"score": 1.0}
 
-    monkeypatch.setattr(defer_module, "async_compute_score_genrm", score)
+    monkeypatch.setattr(
+        defer_module,
+        "get_reward_spec",
+        lambda name: SimpleNamespace(resolve=lambda: score) if name == "judge-rm" else None,
+    )
     collector = DeferredTransferCollector(4, groups=[[_sample(1), _sample(2)]])
 
     with pytest.raises(RuntimeError, match="judge failed"):
@@ -432,12 +460,17 @@ async def test_deferred_reward_exception_waits_for_sibling_before_role_release(s
 async def test_deferred_genrm_writeback_uses_selected_reward_field(score_environment, monkeypatch):
     manager, _events = score_environment
     manager.args.inference_defer_roles = ["genrm"]
+    manager.args.rm_type = "judge-rm"
     manager.args.reward_key = "acc"
 
     async def score(_args, _sample):
         return {"score": 0.25, "acc": 1, "format_error": ""}
 
-    monkeypatch.setattr(defer_module, "async_compute_score_genrm", score)
+    monkeypatch.setattr(
+        defer_module,
+        "get_reward_spec",
+        lambda name: SimpleNamespace(resolve=lambda: score) if name == "judge-rm" else None,
+    )
     monkeypatch.setattr(defer_module, "convert_samples_to_train_data", lambda _args, samples: list(samples))
     sample = _sample(1)
 

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from relax.engine.rewards.dapo_genrm import async_compute_score_genrm
+from relax.engine.rewards.registry import get_reward_spec
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.engine.rollout.deferred_scoring import DeferredBatch
 from relax.engine.rollout.on_policy_distillation import OpdManager
@@ -64,8 +64,17 @@ def validate_deferred_workload(args: Any) -> None:
         raise ValueError("Deferred Teacher requires SGLang OPD")
     if "genrm" in roles:
         models = getattr(args, "_genrm_instances_resolved", {})
-        if len(models) != 1 or getattr(args, "rm_type", None) != "dapo-genrm" or getattr(args, "custom_rm_path", None):
-            raise ValueError("Deferred GenRM currently requires one model with the dapo-genrm reward adapter")
+        reward_spec = get_reward_spec(getattr(args, "rm_type", None))
+        if (
+            len(models) != 1
+            or reward_spec is None
+            or reward_spec.mode != "async"
+            or not reward_spec.supports_deferred
+            or getattr(args, "custom_rm_path", None)
+        ):
+            raise ValueError(
+                "Deferred GenRM requires one model and an async reward adapter that supports deferred execution"
+            )
     if getattr(args, "_genrm_instances_resolved", {}) and "genrm" not in roles:
         raise ValueError("Coordinated defer currently requires every managed scorer to be deferred")
     if getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang" and "teacher" not in roles:
@@ -223,6 +232,8 @@ async def _score_and_publish(manager: Any, collector: DeferredTransferCollector)
     args, rollout_id = manager.args, collector.rollout_id
     coordinator = args._inference_coordinator
     roles = deferred_roles(args)
+    reward_spec = get_reward_spec(getattr(args, "rm_type", None)) if "genrm" in roles else None
+    reward_fn = reward_spec.resolve() if reward_spec is not None else None
     opd = None
     if "teacher" in roles:
         opd = OpdManager(args)
@@ -248,9 +259,7 @@ async def _score_and_publish(manager: Any, collector: DeferredTransferCollector)
     async def reward(groups):
 
         for group in groups:
-            results = await asyncio.gather(
-                *(async_compute_score_genrm(args, sample) for sample in group), return_exceptions=True
-            )
+            results = await asyncio.gather(*(reward_fn(args, sample) for sample in group), return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
