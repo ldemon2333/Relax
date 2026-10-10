@@ -17,6 +17,7 @@ from relax.inference.defer import (
     validate_deferred_workload,
     wait_inference_commit,
 )
+from relax.inference.placement import plan_inference_placement
 
 
 def _args(**values):
@@ -213,6 +214,48 @@ def test_deferred_preflight_accepts_registered_deferred_reward_capability(monkey
             use_opd=False,
         )
     )
+
+
+def test_genrm_defer_recipe_passes_framework_preflight():
+    args = _args(
+        inference_defer_roles=["genrm"],
+        resource={"actor": [1, 16], "rollout": [1, 16], "genrm": [1, 16]},
+        num_gpus_per_node=8,
+        rollout_num_gpus=16,
+        rollout_num_gpus_per_engine=2,
+        _genrm_instances_resolved={
+            "__default__": {
+                "model_path": "judge",
+                "num_gpus": 16,
+                "num_gpus_per_engine": 8,
+                "engine_config": {
+                    "dp_size": 8,
+                    "enable_dp_attention": True,
+                    "tp_size": 8,
+                },
+            }
+        },
+        rm_type="dapo-genrm",
+        custom_rm_path=None,
+        custom_reward_post_process_path=None,
+        use_opd=False,
+        hybrid=False,
+        offload_train=True,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        use_dynamic_batch_size=False,
+        eval_interval=None,
+        eval_prompt_data=None,
+    )
+
+    plan = plan_inference_placement(args)
+
+    assert plan.mode == "defer"
+    assert plan.total_required_gpus == 16
+    assert plan.for_role("rollout")[0].bundle_start == 0
+    assert plan.for_role("genrm")[0].bundle_start == 0
+    validate_deferred_workload(args)
 
 
 @pytest.fixture
