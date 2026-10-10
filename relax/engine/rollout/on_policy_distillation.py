@@ -4,12 +4,11 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
 
 import aiohttp
 import numpy as np
 
-from relax.inference.client import InferenceClient
+from relax.inference.client import generate_with_discovery
 from relax.inference.routing import InferenceRoutingError
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
@@ -155,22 +154,11 @@ class OpdManager:
 
         opsd_worker = opd_opsd_worker.OpsdWorker.from_args(args)
         self.opsd_worker = opsd_worker if opsd_worker.is_opsd else None
-        self._inference_clients: dict[aiohttp.ClientSession, Any] = {}
 
     @asynccontextmanager
     async def _teacher_session(self) -> AsyncIterator[aiohttp.ClientSession]:
         async with _create_teacher_client_session(self.args) as session:
-            client = None
-            discovery_url = getattr(self.args, "_inference_teacher_discovery_url", None)
-            if discovery_url:
-                client = InferenceClient(discovery_url=discovery_url, timeout=float(self.args.opd_teacher_timeout_s))
-                self._inference_clients[session] = client
-            try:
-                yield session
-            finally:
-                self._inference_clients.pop(session, None)
-                if client is not None:
-                    await client.aclose()
+            yield session
 
     def _managed_teacher_route(self, sample: Sample) -> tuple[str | None, str | None]:
         route_key = None
@@ -186,16 +174,22 @@ class OpdManager:
         return route_key, affinity
 
     async def _managed_teacher_logprob(
-        self, session: aiohttp.ClientSession, payload: dict, sample: Sample
+        self, _session: aiohttp.ClientSession, payload: dict, sample: Sample
     ) -> opd_main_worker.LogprobResponse | None:
 
         route_key, affinity_key = self._managed_teacher_route(sample)
-        client = self._inference_clients.get(session)
-        if client is None:
-            raise RuntimeError("Managed Teacher requires a scoped inference client session")
         try:
             normalized_payload = json.loads(_dumps_to_bytes(payload))
-            data = await client.generate(normalized_payload, route_key=route_key, affinity_key=affinity_key)
+            if route_key is not None:
+                normalized_payload["route_key"] = route_key
+            headers = {"X-SMG-Routing-Key": affinity_key} if affinity_key is not None else None
+            data = await generate_with_discovery(
+                self.args._inference_teacher_discovery_url,
+                normalized_payload,
+                headers=headers,
+                timeout=float(self.args.opd_teacher_timeout_s),
+                max_connections=int(getattr(self.args, "opd_teacher_connector_limit", 256)),
+            )
         except InferenceRoutingError as exc:
             if exc.status_code == 400:
                 raise KeyError(f"MOPD routing: {exc}") from exc

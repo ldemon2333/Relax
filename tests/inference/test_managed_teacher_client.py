@@ -67,11 +67,28 @@ def transport(monkeypatch):
         state.clients.append(instance)
         return instance
 
-    monkeypatch.setattr(client_module.httpx, "AsyncClient", client)
+    class HttpxProxy:
+        def __getattr__(self, name):
+            return getattr(httpx, name)
+
+    httpx_proxy = HttpxProxy()
+    httpx_proxy.AsyncClient = client
+    monkeypatch.setattr(client_module, "httpx", httpx_proxy)
     return state
 
 
+@pytest.fixture(autouse=True)
+async def close_inference_clients(monkeypatch):
+    from relax.inference import client as client_module
+
+    await client_module.close_loop_inference_clients()
+    yield
+    await client_module.close_loop_inference_clients()
+
+
 async def test_managed_teacher_discovers_new_endpoint_and_preserves_group_affinity(transport):
+    from relax.inference.client import close_loop_inference_clients
+
     manager = module.OpdManager(_args())
     samples = [_sample(1), _sample(2)]
 
@@ -92,18 +109,26 @@ async def test_managed_teacher_discovers_new_endpoint_and_preserves_group_affini
     }
     assert samples[0].teacher_log_probs == [-1, -2]
     assert len(transport.clients) == 1
+    assert not transport.clients[0].is_closed
+    await close_loop_inference_clients()
     assert transport.clients[0].is_closed
-    assert manager._inference_clients == {}
 
 
-async def test_managed_teacher_concurrent_prefills_have_separate_closed_clients(transport):
+async def test_managed_teacher_concurrent_prefills_reuse_discovery_client(transport):
+    from relax.inference.client import close_loop_inference_clients
+
     manager = module.OpdManager(_args())
 
     await asyncio.gather(manager.prefill([_sample(1)]), manager.prefill([_sample(2, group=2)]))
 
-    assert len(transport.clients) == 2
-    assert all(client.is_closed for client in transport.clients)
-    assert manager._inference_clients == {}
+    get_requests = [request for request in transport.requests if request.method == "GET"]
+    post_requests = [request for request in transport.requests if request.method == "POST"]
+    assert len(transport.clients) == 1
+    assert len(get_requests) == 1
+    assert len(post_requests) == 2
+    assert not transport.clients[0].is_closed
+    await close_loop_inference_clients()
+    assert transport.clients[0].is_closed
 
 
 async def test_managed_teacher_sleeping_discovery_does_not_submit_logprob_request(transport):
@@ -114,7 +139,6 @@ async def test_managed_teacher_sleeping_discovery_does_not_submit_logprob_reques
         await manager.prefill([_sample(1)])
 
     assert not any(request.method == "POST" for request in transport.requests)
-    assert all(client.is_closed for client in transport.clients)
 
 
 async def test_managed_teacher_inline_partial_failure_retains_old_policy_but_deferred_fails(transport):
@@ -140,7 +164,6 @@ async def test_managed_teacher_missing_or_unknown_routes_do_not_fallback(transpo
         await manager.prefill([sample])
 
     assert not any(request.method == "POST" for request in transport.requests)
-    assert all(client.is_closed for client in transport.clients)
 
 
 async def test_external_teacher_keeps_legacy_url_transport_without_discovery(monkeypatch):
@@ -159,4 +182,3 @@ async def test_external_teacher_keeps_legacy_url_transport_without_discovery(mon
 
     assert calls == ["http://stale.example/generate"]
     assert sample.teacher_log_probs == [-1, -2]
-    assert manager._inference_clients == {}
