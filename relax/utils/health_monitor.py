@@ -185,31 +185,41 @@ class RolloutHealthMonitor:
         except ActorUnavailableError as e:
             logger.warning(f"Rollout engine {rollout_engine_id} is temporarily unavailable: {e}")
         except RayActorError as e:
-            guard.failed(engine, e)
-            logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} "
-                f"(actor is dead). Backend cleanup requires node/container recovery. Exception: {e}"
-            )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
-        except Exception as e:
-            # Soft failure: the actor is alive but the sglang subprocess is
-            # unreachable (RayTaskError wrapping ConnectionError/Timeout, etc.).
-            # Accumulate across resume windows until the threshold is hit.
-            self._consecutive_failures[rollout_engine_id] = self._consecutive_failures.get(rollout_engine_id, 0) + 1
-            failure_count = self._consecutive_failures[rollout_engine_id]
-            if failure_count >= self._max_consecutive_failures:
+            with guard.lock:
+                slot = rollout_engine_id * self._engine_group.nodes_per_engine
+                if slot >= len(self._engine_group.all_engines) or self._engine_group.all_engines[slot] is not engine:
+                    return
+                guard.failed(engine, e)
                 logger.error(
                     f"Health check failed for rollout engine {rollout_engine_id} "
-                    f"({failure_count} consecutive failures, threshold={self._max_consecutive_failures}). "
-                    f"Killing actor. Exception: {e}"
+                    f"(actor is dead). Backend exit confirmation is required. Exception: {e}"
                 )
                 self._kill_engine(rollout_engine_id=rollout_engine_id)
-            else:
-                logger.warning(
-                    f"Health check failed for rollout engine {rollout_engine_id} "
-                    f"({failure_count}/{self._max_consecutive_failures} consecutive failures, "
-                    f"will retry). Exception: {e}"
+        except Exception as e:
+            with guard.lock:
+                slot = rollout_engine_id * self._engine_group.nodes_per_engine
+                if slot >= len(self._engine_group.all_engines) or self._engine_group.all_engines[slot] is not engine:
+                    return
+                # Soft failure: the actor is alive but the sglang subprocess is
+                # unreachable (RayTaskError wrapping ConnectionError/Timeout, etc.).
+                # Accumulate across resume windows until the threshold is hit.
+                self._consecutive_failures[rollout_engine_id] = (
+                    self._consecutive_failures.get(rollout_engine_id, 0) + 1
                 )
+                failure_count = self._consecutive_failures[rollout_engine_id]
+                if failure_count >= self._max_consecutive_failures:
+                    logger.error(
+                        f"Health check failed for rollout engine {rollout_engine_id} "
+                        f"({failure_count} consecutive failures, threshold={self._max_consecutive_failures}). "
+                        f"Killing actor. Exception: {e}"
+                    )
+                    self._kill_engine(rollout_engine_id=rollout_engine_id)
+                else:
+                    logger.warning(
+                        f"Health check failed for rollout engine {rollout_engine_id} "
+                        f"({failure_count}/{self._max_consecutive_failures} consecutive failures, "
+                        f"will retry). Exception: {e}"
+                    )
         else:
             # Only a successful check clears the counter. This keeps "consecutive"
             # literal (a single success rescues an intermittently slow engine) and

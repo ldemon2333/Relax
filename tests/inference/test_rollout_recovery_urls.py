@@ -18,6 +18,8 @@ import pytest
 
 from relax.distributed.ray import inference_manager as core
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.utils import scale_utils
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 
 
@@ -41,6 +43,7 @@ class _Engine:
     def __init__(self, runtime, name, url=None):
         self.runtime = runtime
         self.name = name
+        self._actor_id = SimpleNamespace(hex=lambda: name)
         self.url = url
 
     def __getattr__(self, method):
@@ -96,6 +99,7 @@ def rollout_module(runtime):
         "_shutdown_engine_actors",
         "_cleanup_engine_groups",
         "_handle_evictions",
+        "_run_scale_weight_sync_precheck",
     }
     manager = definitions["RolloutManager"]
     manager.bases = []
@@ -107,9 +111,24 @@ def rollout_module(runtime):
     ]
     nodes = [
         definitions[name]
-        for name in ("ScaleInStatus", "ScaleInRequest", "EngineGroupLifecycle", "EngineGroup", "RolloutServer")
+        for name in (
+            "ScaleInStatus",
+            "ScaleInRequest",
+            "ScaleResult",
+            "EngineGroupLifecycle",
+            "_EngineInitRecord",
+            "EngineGroup",
+            "RolloutServer",
+        )
     ]
     nodes.append(manager)
+    engine_path = Path(__file__).parents[2] / "relax/backends/sglang/sglang_engine.py"
+    cleanup = next(
+        node
+        for node in ast.parse(engine_path.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "RouterWorkerCleanup"
+    )
+    nodes.insert(0, cleanup)
 
     def allocate(**kwargs):
         return {
@@ -128,15 +147,23 @@ def rollout_module(runtime):
         "Optional": Optional,
         "asyncio": asyncio,
         "dataclasses": dataclasses,
+        "dataclass": dataclasses.dataclass,
         "enum": enum,
         "os": os,
         "time": time,
         "uuid": uuid,
         "ray": core.ray,
         "logger": get_logger(__name__),
+        "_wrap_ipv6": _wrap_ipv6,
         "EngineShutdownGuard": core.EngineShutdownGuard,
         "InferenceCleanupError": core.InferenceCleanupError,
+        "InferenceRecoveryRequired": core.InferenceRecoveryRequired,
+        "scale_utils": scale_utils,
+        "PrecheckProbeCategory": scale_utils.PrecheckProbeCategory,
+        "ScaleOutFailure": scale_utils.ScaleOutFailure,
+        "ScaleOutFailureCategory": scale_utils.ScaleOutFailureCategory,
         "get_engine_shutdown_guard": core.get_engine_shutdown_guard,
+        "require_probe_cleanup": core.require_probe_cleanup,
         "validate_server_group_gpu_indices": validate_server_group_gpu_indices,
         "_resolve_rollout_engine_class": lambda args: _Engine,
         "PlacementGroupSchedulingStrategy": lambda **kwargs: kwargs,
@@ -352,3 +379,116 @@ async def test_late_old_head_url_probe_cannot_overwrite_recovered_url(rollout_mo
     assert await asyncio.wait_for(pending, timeout=1) == []
     assert group.replica_urls == {0: "[::1]:30001"}
     assert group.all_engines == [head, follower]
+
+
+def test_terminal_multinode_recovery_waits_for_every_backend_session(rollout_module, runtime, monkeypatch):
+    from relax.backends.sglang import process_lifecycle
+
+    _manager, owner, _server, group, head, follower = _topology(rollout_module, runtime)
+    old = [_Engine(runtime, "old-head"), _Engine(runtime, "old-follower")]
+    group.all_engines[:] = old
+    for slot, engine in enumerate(old):
+        group.engine_init_records[slot] = rollout_module._EngineInitRecord(
+            {"node_id": f"node-{slot}", "backend_session": {"session_id": slot + 1}}
+        )
+        core.get_engine_shutdown_guard(group).failed(engine, core.ray.exceptions.ActorDiedError())
+    confirmed = {"node-0"}
+    monkeypatch.setattr(process_lifecycle, "confirm_backend_session_exited", lambda node, identity: node in confirmed)
+
+    with pytest.raises(core.InferenceRecoveryRequired):
+        owner.recover_rollout("policy")
+    assert group.all_engines == [None, old[1]]
+    assert runtime.options == []
+    assert runtime.removed == []
+
+    confirmed.add("node-1")
+    owner.recover_rollout("policy")
+    assert group.all_engines == [head, follower]
+    assert not core.get_engine_shutdown_guard(group).pending_engines()
+    assert runtime.removed == []
+
+
+def test_terminal_exit_confirmation_cannot_clear_replacement(rollout_module, runtime, monkeypatch):
+    from relax.backends.sglang import process_lifecycle
+
+    _manager, _owner, _server, group, head, _follower = _topology(rollout_module, runtime)
+    old = _Engine(runtime, "old-head")
+    group.all_engines[0] = old
+    group.engine_init_records[0] = rollout_module._EngineInitRecord(
+        {"node_id": "node", "backend_session": {"session_id": 1}}
+    )
+    guard = core.get_engine_shutdown_guard(group)
+    guard.failed(old, core.ray.exceptions.ActorDiedError())
+
+    def confirm(node, identity):
+        group.all_engines[0] = head
+        return True
+
+    monkeypatch.setattr(process_lifecycle, "confirm_backend_session_exited", confirm)
+    group.reconcile_terminal_engines()
+    assert group.all_engines[0] is head
+    assert guard.pending_engines() == (old,)
+
+
+def test_terminal_backend_exit_does_not_clear_unconfirmed_nccl_probe(rollout_module, runtime, monkeypatch):
+    from relax.backends.sglang import process_lifecycle
+
+    _manager, _owner, _server, group, head, _follower = _topology(rollout_module, runtime)
+    group.all_engines[0] = head
+    record = rollout_module._EngineInitRecord({"node_id": "node", "backend_session": {"session_id": 1}})
+    record.pending_probe_tokens.add("inflight-probe")
+    group.engine_init_records[0] = record
+    guard = core.get_engine_shutdown_guard(group)
+    guard.failed(head, core.ray.exceptions.ActorDiedError())
+    monkeypatch.setattr(process_lifecycle, "confirm_backend_session_exited", lambda *args: True)
+    group.reconcile_terminal_engines()
+    assert group.all_engines[0] is head
+    assert guard.pending_engines() == (head,)
+    record.pending_probe_tokens.clear()
+    group.reconcile_terminal_engines()
+    assert group.all_engines[0] is None
+
+
+@pytest.mark.parametrize("cleanup_confirmed", [False, True])
+async def test_probe_cleanup_evidence_gates_rebuild_after_successful_shutdown(
+    rollout_module, runtime, cleanup_confirmed
+):
+    manager, owner, _server, group, head, follower = _topology(rollout_module, runtime)
+    group.all_engines[:] = [head, follower]
+    record = rollout_module._EngineInitRecord({"node_id": "node"})
+    group.engine_init_records[0] = record
+    manager._SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = 1
+
+    async def ports(*args):
+        return ["15000"]
+
+    manager._allocate_scale_weight_sync_precheck_ports = ports
+    for engine in (head, follower):
+        runtime.results[engine.name, "get_scale_weight_sync_transport_fingerprint"] = {}
+
+        def probe():
+            assert record.pending_probe_tokens
+            return _Ref({"success": True, "cleanup_confirmed": cleanup_confirmed})
+
+        runtime.results[engine.name, "run_scale_weight_sync_precheck"] = probe
+    result = await manager._run_scale_weight_sync_precheck(
+        head, [follower], master_address="127.0.0.1", tp_size=1, timeout=10
+    )
+    assert result.success
+    assert bool(record.pending_probe_tokens) is not cleanup_confirmed
+    if cleanup_confirmed:
+        group.shutdown_engines({0, 1})
+        assert group.all_engines == [None, None]
+        owner.recover_rollout("policy")
+        assert group.all_engines == [head, follower]
+    else:
+        with pytest.raises(core.InferenceCleanupError):
+            group.shutdown_engines({0, 1})
+        assert group.all_engines == [head, None]
+        assert head not in runtime.killed
+        # Even a previously cleared slot must not discard auxiliary evidence.
+        group.all_engines[0] = None
+        with pytest.raises(core.InferenceRecoveryRequired, match="NCCL probe"):
+            owner.recover_rollout("policy")
+        assert runtime.options == []
+        assert group.engine_init_records[0] is record

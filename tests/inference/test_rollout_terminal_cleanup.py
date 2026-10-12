@@ -37,10 +37,11 @@ def rollout_methods():
         "InferenceCleanupError": core.InferenceCleanupError,
         "InferenceRecoveryRequired": core.InferenceRecoveryRequired,
         "get_engine_shutdown_guard": core.get_engine_shutdown_guard,
+        "require_probe_cleanup": core.require_probe_cleanup,
     }
     nodes = [definitions[name] for name in ("ScaleOutStatus", "ScaleOutRequest", "EngineGroupLifecycle")]
     for class_name, names in {
-        "EngineGroup": {"shutdown_engines"},
+        "EngineGroup": {"shutdown_engines", "reconcile_terminal_engines"},
         "RolloutServer": {"recover"},
         "RolloutManager": {"_shutdown_engine_actors", "dispose", "execute_scale_out"},
     }.items():
@@ -93,6 +94,9 @@ def runtime(monkeypatch):
 def _topology(methods, runtime, *, slots=1):
     engines = [_Engine(runtime, str(index)) for index in range(slots)]
     group = SimpleNamespace(
+        args=SimpleNamespace(),
+        external_engines=False,
+        engine_init_records={},
         all_engines=list(engines),
         nodes_per_engine=slots,
         num_gpus_per_engine=slots,
@@ -106,6 +110,7 @@ def _topology(methods, runtime, *, slots=1):
         start_engines=MagicMock(side_effect=AssertionError("must not rebuild fenced workers")),
     )
     group.shutdown_engines = MethodType(methods.shutdown_engines, group)
+    group.reconcile_terminal_engines = MethodType(methods.reconcile_terminal_engines, group)
     server = SimpleNamespace(model_name="policy", engine_groups=[group])
     server.recover = MethodType(methods.recover, server)
     owner = core.InferenceManager.for_rollout(SimpleNamespace(offload_rollout=False), {"policy": server})

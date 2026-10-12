@@ -166,6 +166,7 @@ class EngineShutdownGuard:
     def __init__(self) -> None:
         # Retain the handle so Python object IDs cannot be reused while fenced.
         self._terminal: dict[int, Any] = {}
+        self.lock = threading.RLock()
 
     def check(self, engine: Any) -> None:
         if id(engine) in self._terminal:
@@ -179,6 +180,14 @@ class EngineShutdownGuard:
                 "Node/container cleanup must be confirmed before a fresh job can reuse these resources."
             )
         return error
+
+    def pending_engines(self) -> tuple[Any, ...]:
+        return tuple(self._terminal.values())
+
+    def confirmed_stopped(self, engine: Any) -> None:
+        """Release only the generation whose backend exit was confirmed."""
+        if self._terminal.get(id(engine)) is engine:
+            del self._terminal[id(engine)]
 
     def require_recovery(self) -> None:
         if self._terminal:
@@ -194,6 +203,12 @@ def get_engine_shutdown_guard(owner: Any) -> EngineShutdownGuard:
         guard = EngineShutdownGuard()
         owner._engine_shutdown_guard = guard
     return guard
+
+
+def require_probe_cleanup(owner: Any, slot: int) -> None:
+    record = getattr(owner, "engine_init_records", {}).get(slot)
+    if record is not None and record.pending_probe_tokens:
+        raise InferenceCleanupError(f"Worker {slot} has unconfirmed NCCL probe cleanup")
 
 
 class InferenceManager:
@@ -416,6 +431,9 @@ class InferenceManager:
             if server is None:
                 return
             for group in server.engine_groups:
+                reconcile = getattr(group, "reconcile_terminal_engines", None)
+                if callable(reconcile):
+                    reconcile()
                 get_engine_shutdown_guard(group).require_recovery()
             observation = self._inference_observation
             before = observation.begin(self.rollout_replicas(server.model_name), "ONLOADING")
@@ -448,6 +466,7 @@ class InferenceManager:
                         guard = get_engine_shutdown_guard(group)
                         try:
                             guard.check(engine)
+                            require_probe_cleanup(group, index)
                             refs.append((group, index, engine, engine.shutdown.remote()))
                         except Exception as exc:
                             errors.append(guard.failed(engine, exc))

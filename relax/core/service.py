@@ -86,9 +86,31 @@ class Service:
         if self._deployed:
             raise RuntimeError(f"[{self.role}] Service has already been deployed")
         self._validate_inference_binding()
-        self._deploy(self.pgs)
+        try:
+            self._deploy(self.pgs)
+        except Exception:
+            # A failed Serve deployment can leave the PG allocated even though
+            # this wrapper never becomes visible to the Controller.
+            try:
+                serve.delete(self.role)
+            except Exception as exc:
+                logger.warning(f"[{self.role}] Failed to delete deployment after deploy error: {exc}")
+            self._release_placement_group()
+            raise
         self._deployed = True
         logger.info(f"[{self.role}] Service deployed successfully")
+
+    def _release_placement_group(self) -> None:
+        """Release this service's owned placement group, if any."""
+        if self.pgs is None or self._is_shared_pgs:
+            return
+        pg = self.pgs[0] if isinstance(self.pgs, tuple) else self.pgs
+        try:
+            remove_placement_group(pg)
+        except Exception as exc:
+            logger.warning(f"[{self.role}] Failed to release placement group: {exc}")
+        else:
+            self.pgs = None
 
     def _validate_inference_binding(self) -> None:
         plan = getattr(self.config, "_inference_placement_plan", None)
@@ -123,11 +145,11 @@ class Service:
         if str(self.role) in {"rollout", "genrm"}:
             ray_actor_options.update(num_gpus=0)
         if self.data_source is not None:
-            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
             )
         else:
-            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
@@ -193,7 +215,10 @@ class Service:
         """Run the service with fault supervision.
 
         Returns:
-            A Ray ObjectRef for the async task.
+            A Ray Serve ``DeploymentResponse`` (``self.handle`` is a
+            DeploymentHandle, so ``.remote()`` does NOT return an ObjectRef).
+            Callers must not pass it to ``ray.cancel()``; use its own
+            ``.cancel()`` -- see Controller._cancel_pending_tasks.
         """
         self.healthy.set_task_status.remote(self.role, True)
         self._start_heartbeat()

@@ -230,6 +230,8 @@ def test_actual_sglang_launch_keeps_follower_process_and_rolls_back_failed_head(
     killed = []
     monkeypatch.setattr(module.multiprocessing, "set_start_method", lambda *args, **kwargs: None)
     monkeypatch.setattr(module.multiprocessing, "Process", lambda **kwargs: process)
+    ready = SimpleNamespace(poll=lambda timeout: True, recv=lambda: {"session_id": process.pid}, close=lambda: None)
+    monkeypatch.setattr(module.multiprocessing, "Pipe", lambda **kwargs: (ready, ready))
 
     def kill(pid):
         killed.append(pid)

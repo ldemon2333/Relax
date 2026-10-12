@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -30,13 +31,19 @@ def publication(monkeypatch):
     observation = _InferenceObservation("rollout")
     key = "default/group-0/replica-0"
     observation.initialized(key, [engine], weights_ready=False)
+    record = SimpleNamespace(pending_router_registration=False)
+    group = SimpleNamespace(all_engines=[engine], engine_init_records={0: record})
+    replicas = {key: [engine]}
     manager = SimpleNamespace(
-        _get_server=lambda _: SimpleNamespace(model_name="default"),
+        _engine_lifecycle_lock=threading.RLock(),
+        _get_server=lambda _: SimpleNamespace(model_name="default", engine_groups=[group]),
         _get_inference_observation=lambda: observation,
-        _inference_replicas=lambda _: {key: [engine]},
+        _inference_replicas=lambda _: replicas,
     )
     return SimpleNamespace(
-        publish=lambda: namespace["mark_inference_weights_ready"](manager),
+        publish=lambda **kwargs: namespace["mark_inference_weights_ready"](manager, **kwargs),
+        record=record,
+        replicas=replicas,
         engine=engine,
         observation=observation,
         key=key,
@@ -89,3 +96,34 @@ def test_weight_publication_accepts_zero_version(publication):
     entry = publication.observation.entries[publication.key]
     assert entry["state"] == "READY"
     assert entry["weight_version"] == "0"
+
+
+@pytest.mark.parametrize("synced", [[], ["different-generation"]])
+def test_weight_publication_excludes_unsynced_heads(publication, synced):
+    publication.engine._actor_id.hex.return_value = "current-generation"
+    publication.engine.get_weight_version.remote.return_value = "old-version"
+    publication.publish(synced_actor_ids=synced)
+    entry = publication.observation.entries[publication.key]
+    assert not entry["weights_ready"] and not entry["admission"]
+    publication.engine.get_weight_version.remote.assert_not_called()
+
+
+@pytest.mark.parametrize("synced", [None, ["current-generation"]])
+def test_weight_publication_waits_for_router_registration(publication, synced):
+    publication.engine._actor_id.hex.return_value = "current-generation"
+    publication.record.pending_router_registration = True
+    publication.publish(synced_actor_ids=synced)
+    assert not publication.observation.entries[publication.key]["weights_ready"]
+    publication.engine.get_weight_version.remote.assert_not_called()
+    publication.record.pending_router_registration = False
+    publication.engine.get_weight_version.remote.return_value = "9"
+    publication.publish(synced_actor_ids=synced)
+    assert publication.observation.entries[publication.key]["weights_ready"]
+
+
+def test_weight_publication_requires_only_multinode_head_receipt(publication):
+    publication.engine._actor_id.hex.return_value = "head-generation"
+    publication.engine.get_weight_version.remote.return_value = "9"
+    publication.replicas[publication.key].append(MagicMock())
+    publication.publish(synced_actor_ids=["head-generation"])
+    assert publication.observation.entries[publication.key]["weights_ready"]

@@ -283,6 +283,7 @@ def test_engine_router_publishes_guard_but_management_uses_private_backend(sglan
     engine.router_ip, engine.router_port = "router.example", 32103
     engine.worker_type = "regular"
     engine.args = SimpleNamespace(use_slime_router=False)
+    monkeypatch.setattr(engine, "is_evicted", lambda: False)
     captured = []
 
     class Response:

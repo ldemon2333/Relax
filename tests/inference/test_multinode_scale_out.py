@@ -18,6 +18,7 @@ import pytest
 
 from relax.distributed.ray import inference_manager as core
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 from relax.utils.s3_model_loader import build_runai_streamer_env_for_load, is_s3_uri
 from relax.utils.scale_utils import ScaleOutFailure, ScaleOutFailureCategory
@@ -35,6 +36,7 @@ def _load_production(runtime, *, legacy_slots=False):
     namespace = {
         "asyncio": asyncio,
         "dataclasses": dataclasses,
+        "dataclass": dataclasses.dataclass,
         "enum": enum,
         "os": os,
         "time": time,
@@ -43,10 +45,12 @@ def _load_production(runtime, *, legacy_slots=False):
         "Optional": Optional,
         "ray": runtime.ray,
         "logger": get_logger(__name__),
+        "_wrap_ipv6": _wrap_ipv6,
         "EngineShutdownGuard": core.EngineShutdownGuard,
         "InferenceCleanupError": core.InferenceCleanupError,
         "InferenceRecoveryRequired": core.InferenceRecoveryRequired,
         "get_engine_shutdown_guard": core.get_engine_shutdown_guard,
+        "require_probe_cleanup": core.require_probe_cleanup,
         "ScaleOutFailure": ScaleOutFailure,
         "ScaleOutFailureCategory": ScaleOutFailureCategory,
         "validate_server_group_gpu_indices": validate_server_group_gpu_indices,
@@ -61,6 +65,7 @@ def _load_production(runtime, *, legacy_slots=False):
         "ScaleOutStatus",
         "ScaleOutRequest",
         "EngineGroupLifecycle",
+        "_EngineInitRecord",
         "EngineGroup",
         "EngineFinalizeResult",
         "ScaleResult",
@@ -68,6 +73,14 @@ def _load_production(runtime, *, legacy_slots=False):
         "_allocate_rollout_engine_addr_and_ports_normal",
     )
     nodes = [definitions[name] for name in names]
+    engine_path = Path(__file__).parents[2] / "relax/backends/sglang/sglang_engine.py"
+    cleanup = next(
+        node
+        for node in ast.parse(engine_path.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "RouterWorkerCleanup"
+    )
+    nodes.insert(0, cleanup)
+
     methods = {"_bring_up_single_replica", "_rollback_engines"}
     for node in definitions["RolloutManager"].body:
         if isinstance(node, ast.AsyncFunctionDef) and node.name in methods:
@@ -105,11 +118,13 @@ def _server_args_for(engine, init):
     namespace = {
         "os": os,
         "dataclasses": dataclasses,
+        "dataclass": dataclasses.dataclass,
         "ServerArgs": dataclasses.make_dataclass("ServerArgs", fields),
         "is_s3_uri": is_s3_uri,
         "device_utils": SimpleNamespace(get_visible_devices_env_var=lambda: "RELAX_SCALE_TEST_VISIBLE_DEVICES"),
         "_EXTERNAL_ENGINE_SKIP_CHECK_FIELDS": [],
         "logger": get_logger(__name__),
+        "_wrap_ipv6": _wrap_ipv6,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_compute_server_args"](
@@ -144,6 +159,7 @@ class _Engine:
     def __init__(self, runtime, options, args, constructor):
         self.runtime, self.options, self.args, self.constructor = runtime, options, args, constructor
         self.rank = constructor["rank"]
+        self._actor_id = SimpleNamespace(hex=lambda: f"actor-{self.rank}")
         self.bundle = options["scheduling_strategy"].placement_group_bundle_index
         self.ip, _ = runtime.locations[self.bundle]
 
@@ -181,6 +197,7 @@ def _runtime(gpus_per_node, replica_gpus):
         return SimpleNamespace(remote=lambda: actor)
 
     runtime.ray = SimpleNamespace(
+        ObjectRef=_ObjectRef,
         remote=lambda cls: SimpleNamespace(options=engine_options),
         get=lambda ref, timeout=None: ref.get(),
         kill=runtime.killed.append,
@@ -207,7 +224,13 @@ def _setup(gpus_per_node=8, replica_gpus=16, *, legacy_slots=False):
         use_rollout_routing_replay=False,
         fp16=False,
     )
-    server = SimpleNamespace(model_name="policy", router_ip="192.0.2.254", router_port=3000, engine_groups=[])
+    template = SimpleNamespace(
+        worker_type="regular",
+        is_scaled_out=False,
+        lifecycle_status=production.EngineGroupLifecycle.ACTIVE,
+        sglang_overrides={},
+    )
+    server = SimpleNamespace(model_name="policy", router_ip="192.0.2.254", router_port=3000, engine_groups=[template])
     owner = core.InferenceManager.for_rollout(args, {"policy": server})
     manager = SimpleNamespace(args=args, _port_cursors={0: 15000}, _get_inference_manager=lambda: owner)
     manager._bring_up_single_replica = MethodType(production._bring_up_single_replica, manager)
@@ -301,7 +324,8 @@ async def test_multinode_scale_out_init_failure_rolls_back_both_workers(failed_r
     _assert_multinode_created(case)
     assert [rank for rank, method, _ in case.runtime.calls if method == "shutdown"] == [2, 3]
     assert [actor for actor in case.runtime.killed if isinstance(actor, _Engine)] == case.runtime.engines
-    assert case.server.engine_groups == []
+    assert len(case.server.engine_groups) == 1
+    assert not case.server.engine_groups[0].is_scaled_out
     case.manager._finalize_engine_group_registration.assert_not_awaited()
 
 
@@ -313,8 +337,8 @@ async def test_multinode_scale_out_terminal_follower_retains_group_and_fences_re
         await _bring_up(case)
     _assert_multinode_created(case)
     head, follower = case.runtime.engines
-    assert len(case.server.engine_groups) == 1
-    group = case.server.engine_groups[0]
+    assert len(case.server.engine_groups) == 2
+    group = case.server.engine_groups[1]
     assert group.all_engines == [None, follower]
     assert group.pg[0] is case.pg
     assert group.pg_owned is True
