@@ -1181,7 +1181,12 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
+    def stop_owned_routers(self) -> int:
+        """Stop Router subprocesses launched in this actor process."""
+        return stop_launched_routers()
+
     def dispose(self):
+        self.stop_owned_routers()
         self._stop_eviction_monitor()
         for monitor in self._health_monitors:
             monitor.stop()
@@ -4794,15 +4799,15 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     return router_ip, router_port
 
 
-# Router processes launched via `_start_router`. Retained so
-# `Controller._global_restart` can terminate them before re-initializing —
+# Router processes launched via `_start_router`, tracked per calling process.
+# Retained so RolloutManager can terminate its Routers before re-initializing —
 # otherwise the daemon router survives with stale pre-restart engine URLs and
 # spams "Connection refused" health-check WARNs against dead ports forever.
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
 
 
 def stop_launched_routers() -> int:
-    """Terminate every router process launched in this Controller lifetime.
+    """Terminate every Router process launched in this process.
 
     Returns the number of processes that were alive and successfully killed —
     callers use this to decide whether to reset cached router endpoint state.

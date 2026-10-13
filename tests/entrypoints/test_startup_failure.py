@@ -381,7 +381,7 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
+def test_controller_partial_startup_cleans_teacher_without_local_router_cleanup(monkeypatch):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
@@ -401,4 +401,39 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     )
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
-    stop_routers.assert_called_once()
+    stop_routers.assert_not_called()
+
+
+def test_controller_shutdown_disposes_router_in_rollout_manager(monkeypatch):
+    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
+    stop_routers = Mock()
+    monkeypatch.setitem(
+        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
+    )
+    dispose_ref = object()
+    dispose_remote = Mock(return_value=dispose_ref)
+    manager = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_remote))
+    service = SimpleNamespace(get_rollout_manager=Mock(return_value=manager))
+    ray_get = Mock(return_value=None)
+    ns = {
+        "logger": Mock(),
+        "ROLES": SimpleNamespace(rollout="rollout"),
+        "run": lambda value: value,
+        "ray": SimpleNamespace(get=ray_get),
+        "shutdown_managed_opd_teacher": Mock(),
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "controller.py", "exec"), ns)
+    controller = SimpleNamespace(
+        serve_dict={"rollout": service},
+        _teacher_manager=None,
+        _shutdown_agentic_rollout_services=Mock(),
+        _cleanup_s3_model_weights_after_init=Mock(),
+    )
+
+    ns["shutdown"](controller)
+
+    dispose_remote.assert_called_once_with()
+    ray_get.assert_called_once_with(dispose_ref, timeout=30)
+    stop_routers.assert_not_called()

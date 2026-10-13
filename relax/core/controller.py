@@ -1149,33 +1149,18 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
-        # Shut down rollout engines via RolloutManager.dispose()
+        # Dispose actor-owned Routers and rollout engines in RolloutManager.
         if ROLES.rollout in self.serve_dict:
             try:
                 rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
                 ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — SGLang engines shut down.")
+                logger.info("RolloutManager disposed — Routers and SGLang engines shut down.")
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()
-
-        # Router processes must be terminated explicitly.  They are daemonic,
-        # but ``daemon=True`` only reaps through multiprocessing's atexit hook,
-        # and every exit path in ``entrypoints/train.py`` ends in ``os._exit()``
-        # — which skips atexit entirely.  Without this the router is reparented
-        # to init and outlives the job: measured at ~1.4 GB RSS and a 378 MiB
-        # CUDA context on GPU 0 per submission, accumulating across runs.
-        try:
-            from relax.distributed.ray.rollout import stop_launched_routers
-
-            killed = stop_launched_routers()
-            if killed > 0:
-                logger.info(f"Terminated {killed} router process(es) during shutdown")
-        except Exception as e:
-            logger.warning(f"Failed to terminate router processes during shutdown: {e}")
 
         try:
             self._cleanup_s3_model_weights_after_init(force=True)
@@ -1391,6 +1376,17 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to stop heartbeat for '{svc_role}': {e}")
 
+            if svc_role == ROLES.rollout:
+                try:
+                    rollout_manager = run(service.get_rollout_manager())
+                    stopped_routers = ray.get(rollout_manager.stop_owned_routers.remote(), timeout=30)
+                    if stopped_routers:
+                        self.config.sglang_router_ip = None
+                        self.config.sglang_router_port = None
+                        logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s), endpoint reset")
+                except Exception as e:
+                    logger.warning(f"[Global Restart] Failed to stop RolloutManager Routers: {e}")
+
             try:
                 serve.delete(svc_role)
                 logger.info(f"[Global Restart] Deleted Ray Serve deployment '{svc_role}'")
@@ -1439,28 +1435,7 @@ class Controller:
         shutdown_async_loop()
         logger.info("[Global Restart] Async event loop stopped")
 
-        # --- 1.9 Terminate router processes and reset cached endpoint ---
-        # The router runs as a daemon subprocess of this main process, so it
-        # survives ray.shutdown().  If we don't kill it, the pre-restart engine
-        # URLs stay in its worker list forever (endless "Connection refused"
-        # health WARNs on dead ports), and post-restart `_start_router` also
-        # short-circuits because `sglang_router_ip`/`_port` were written back
-        # to the config on first launch.
-        try:
-            from relax.distributed.ray.rollout import stop_launched_routers
-
-            killed = stop_launched_routers()
-            # Only clear cached endpoint if we actually owned & killed a router.
-            # An externally-provided router (--sglang-router-ip) was never in
-            # our launched list, so we leave the endpoint set to reuse it.
-            if killed > 0:
-                self.config.sglang_router_ip = None
-                self.config.sglang_router_port = None
-                logger.info(f"[Global Restart] Terminated {killed} router process(es), endpoint reset")
-        except Exception as e:
-            logger.warning(f"[Global Restart] Failed to terminate router: {e}")
-
-        # --- 1.10 Shutdown Ray Serve and Ray to kill all processes ---
+        # --- 1.9 Shutdown Ray Serve and Ray to kill all processes ---
         try:
             serve.shutdown()
             logger.info("[Global Restart] Ray Serve shutdown completed")
@@ -1485,7 +1460,7 @@ class Controller:
         time.sleep(5)
         logger.info("[Global Restart] Waited 5s for resource release")
 
-        # --- 1.11 Re-initialize Ray and Ray Serve (same as train.py) ---
+        # --- 1.10 Re-initialize Ray and Ray Serve (same as train.py) ---
         ray.init(runtime_env=runtime_env)
         logger.info("[Global Restart] Ray re-initialized")
         try:
