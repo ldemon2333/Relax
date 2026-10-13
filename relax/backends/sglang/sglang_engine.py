@@ -1466,6 +1466,14 @@ class SGLangEngine(RayActor):
         verbatim, so socket-only mode is accepted only when both engine actors
         already received the same job-start environment.
         """
+        # Keep exit evidence beyond this RPC: the manager may time out, or a
+        # killed child may only exit after we return cleanup_confirmed=False.
+        # This actor's probe and cleanup-query RPCs execute serially.
+        if not hasattr(self, "_scale_weight_sync_probes"):
+            self._scale_weight_sync_probes = {}
+        if run_token in self._scale_weight_sync_probes:
+            raise ValueError(f"NCCL probe token already used: {run_token}")
+        processes = self._scale_weight_sync_probes[run_token] = []
         if self.engine_spec is not None:
             self.engine_spec.require_operation("run_scale_weight_sync_precheck")
         if self.node_rank != 0:
@@ -1568,7 +1576,6 @@ class SGLangEngine(RayActor):
                 "results": [],
             }
 
-        processes = []
         log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
         started_at = time.monotonic()
         for local_rank, port in enumerate(port_list):
@@ -1704,6 +1711,20 @@ class SGLangEngine(RayActor):
                 except Exception:
                     pass
             log_directory.cleanup()
+
+    def get_scale_weight_sync_probe_cleanup(self, run_tokens: list[str]) -> list[str]:
+        """Confirm only known probes whose children have all exited.
+
+        Retain confirmations so a lost query response can safely be retried.
+        Unknown tokens (including after actor replacement) fail closed.
+        """
+        probes = getattr(self, "_scale_weight_sync_probes", {})
+        confirmed = []
+        for token in run_tokens:
+            if token in probes and all(process.poll() is not None for _, process, _, _ in probes[token]):
+                probes[token] = []  # Drop reaped handles, retain the confirmation.
+                confirmed.append(token)
+        return confirmed
 
     def pause_generation(self, timeout: float | None = None):
         admission = getattr(self, "_admission_server", None)

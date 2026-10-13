@@ -492,3 +492,129 @@ async def test_probe_cleanup_evidence_gates_rebuild_after_successful_shutdown(
             owner.recover_rollout("policy")
         assert runtime.options == []
         assert group.engine_init_records[0] is record
+
+
+@pytest.mark.parametrize("failure", ["timeout", "retry"])
+@pytest.mark.parametrize("shutdown_path", ["group", "manager", "scale-in"])
+async def test_probe_cleanup_reconciles_lost_evidence(rollout_module, runtime, monkeypatch, failure, shutdown_path):
+    manager, owner, _server, group, head, follower = _topology(rollout_module, runtime)
+    group.all_engines[:] = [head, follower]
+    record = rollout_module._EngineInitRecord({"node_id": "node"})
+    group.engine_init_records[0] = record
+    manager._SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = 2
+
+    async def ports(*args):
+        return ["15000"]
+
+    manager._allocate_scale_weight_sync_precheck_ports = ports
+    for engine in (head, follower):
+        runtime.results[engine.name, "get_scale_weight_sync_transport_fingerprint"] = {}
+    release = asyncio.Event()
+    remote_tasks = []
+    attempts = []
+
+    def probe():
+        attempts.append(set(record.pending_probe_tokens))
+        if failure == "retry":
+            return _Ref(
+                {"success": False, "cleanup_confirmed": False, "category": "launch_transient"}
+                if len(attempts) == 1
+                else {"success": True, "cleanup_confirmed": True}
+            )
+
+        async def remote_probe():
+            await release.wait()
+            return {"success": True, "cleanup_confirmed": True}
+
+        task = asyncio.create_task(remote_probe())
+        remote_tasks.append(task)
+        return asyncio.shield(task)
+
+    runtime.results[head.name, "run_scale_weight_sync_precheck"] = probe
+    runtime.results[follower.name, "run_scale_weight_sync_precheck"] = {
+        "success": True,
+        "cleanup_confirmed": True,
+    }
+    if failure == "timeout":
+
+        async def wait_for(awaitable, timeout):
+            if timeout == 25:
+                # Cancel only local waiting, as a manager timeout does; the
+                # remote operation is still running and will confirm cleanup.
+                await asyncio.sleep(0)
+                awaitable.cancel()
+                try:
+                    await awaitable
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(awaitable, timeout)
+
+        namespace = manager._run_scale_weight_sync_precheck.__func__.__globals__
+        monkeypatch.setitem(namespace, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait_for": wait_for}))
+
+    result = await manager._run_scale_weight_sync_precheck(head, [follower], "127.0.0.1", 1, 10)
+    assert result.success is (failure == "retry")
+    assert len(attempts) == (2 if failure == "retry" else 1)
+    assert record.pending_probe_tokens == attempts[0]
+
+    async def shutdown():
+        if shutdown_path == "group":
+            group.shutdown_engines({0})
+        elif shutdown_path == "manager":
+            owner.shutdown_rollout()
+        else:
+            await manager._shutdown_engine_actors(group, "probe-group", [(0, head)], 1)
+
+    runtime.results[head.name, "get_scale_weight_sync_probe_cleanup"] = []
+    with pytest.raises(core.InferenceCleanupError):
+        await shutdown()
+    assert head not in runtime.killed
+    assert not any(name == head.name and method == "shutdown" for name, method, _kwargs in runtime.calls)
+
+    release.set()
+    if remote_tasks:
+        assert all(item["cleanup_confirmed"] for item in await asyncio.gather(*remote_tasks))
+    runtime.results[head.name, "get_scale_weight_sync_probe_cleanup"] = list(attempts[0])
+    await shutdown()
+    assert not record.pending_probe_tokens
+    assert group.all_engines[0] is None
+    assert head in runtime.killed
+
+
+@pytest.mark.parametrize("response", [[], ["unrelated"], True, TimeoutError("query timeout")])
+def test_probe_cleanup_query_requires_matching_evidence(rollout_module, runtime, response):
+    _manager, _owner, _server, group, head, _follower = _topology(rollout_module, runtime)
+    group.all_engines[0] = head
+    record = rollout_module._EngineInitRecord({})
+    record.pending_probe_tokens.add("pending")
+    group.engine_init_records[0] = record
+    runtime.results[head.name, "get_scale_weight_sync_probe_cleanup"] = response
+    with pytest.raises(core.InferenceCleanupError):
+        core.require_probe_cleanup(group, 0)
+    assert record.pending_probe_tokens == {"pending"}
+
+
+@pytest.mark.parametrize("changed", ["record", "actor", "tokens"])
+def test_probe_cleanup_query_preserves_new_evidence(rollout_module, runtime, changed):
+    _manager, _owner, _server, group, head, follower = _topology(rollout_module, runtime)
+    group.all_engines[0] = head
+    record = rollout_module._EngineInitRecord({})
+    record.pending_probe_tokens.add("pending")
+    group.engine_init_records[0] = record
+
+    def query():
+        if changed == "record":
+            replacement = rollout_module._EngineInitRecord({})
+            replacement.pending_probe_tokens.add("pending")
+            group.engine_init_records[0] = replacement
+        elif changed == "actor":
+            group.all_engines[0] = follower
+        else:
+            record.pending_probe_tokens.add("new")
+        return _Ref(["pending", "new"])
+
+    runtime.results[head.name, "get_scale_weight_sync_probe_cleanup"] = query
+    with pytest.raises(core.InferenceCleanupError):
+        core.require_probe_cleanup(group, 0)
+    assert group.engine_init_records[0].pending_probe_tokens == ({"new"} if changed == "tokens" else {"pending"})

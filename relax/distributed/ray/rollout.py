@@ -4709,7 +4709,7 @@ class RolloutManager(ReloadableMixin):
 
         async def _shutdown(slot, engine):
             guard.check(engine)
-            require_probe_cleanup(group, slot)
+            await asyncio.to_thread(require_probe_cleanup, group, slot)
             return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
         shutdown_results = await asyncio.gather(

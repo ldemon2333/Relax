@@ -206,9 +206,24 @@ def get_engine_shutdown_guard(owner: Any) -> EngineShutdownGuard:
 
 
 def require_probe_cleanup(owner: Any, slot: int) -> None:
-    record = getattr(owner, "engine_init_records", {}).get(slot)
-    if record is not None and record.pending_probe_tokens:
-        raise InferenceCleanupError(f"Worker {slot} has unconfirmed NCCL probe cleanup")
+    guard = get_engine_shutdown_guard(owner)
+    with guard.lock:
+        record = getattr(owner, "engine_init_records", {}).get(slot)
+        if record is None or not record.pending_probe_tokens:
+            return
+        engine = owner.all_engines[slot]
+        tokens = set(record.pending_probe_tokens)
+    try:
+        confirmed = ray.get(engine.get_scale_weight_sync_probe_cleanup.remote(run_tokens=list(tokens)), timeout=10)
+    except Exception as exc:
+        raise InferenceCleanupError(f"Worker {slot} NCCL probe cleanup query failed") from exc
+    with guard.lock:
+        if owner.engine_init_records.get(slot) is not record or owner.all_engines[slot] is not engine:
+            raise InferenceCleanupError(f"Worker {slot} changed during NCCL probe cleanup query")
+        if isinstance(confirmed, list) and all(isinstance(token, str) for token in confirmed):
+            record.pending_probe_tokens.difference_update(tokens.intersection(confirmed))
+        if record.pending_probe_tokens:
+            raise InferenceCleanupError(f"Worker {slot} has unconfirmed NCCL probe cleanup")
 
 
 class InferenceManager:
