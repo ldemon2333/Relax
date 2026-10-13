@@ -11,12 +11,15 @@ import pytest
 def legacy_rollout(monkeypatch):
     pytest.importorskip("sglang")
 
+    from ray.core.generated.gcs_pb2 import ActorTableData
+
     from relax.distributed.ray import rollout
 
     engines = [MagicMock() for _ in range(4)]
-    for rank, engine in enumerate(engines):
-        engine.get_url.remote.return_value = f"http://worker-{rank}.example:15000"
-        engine.get_pid_and_node_id.remote.return_value = {"pid": 100 + rank, "node_id": f"node-{rank}"}
+    for engine in engines:
+        engine._get_local_state.return_value = ActorTableData.ALIVE
+        engine.get_url.remote.side_effect = lambda: pytest.fail("discovery submitted get_url RPC")
+        engine.get_pid_and_node_id.remote.side_effect = lambda: pytest.fail("discovery submitted PID RPC")
     group = rollout.EngineGroup(
         args=SimpleNamespace(num_gpus_per_node=2),
         pg=None,
@@ -26,6 +29,12 @@ def legacy_rollout(monkeypatch):
         rank_offset=6,
         gpu_offset=8,
     )
+    group.engine_init_records = {
+        rank: rollout._EngineInitRecord(
+            {"url": f"http://worker-{rank}.example:15000", "pid": 100 + rank, "node_id": f"node-{rank}"}
+        )
+        for rank in range(4)
+    }
     server = rollout.RolloutServer(
         engine_groups=[group],
         router_ip="router.example",
@@ -34,6 +43,7 @@ def legacy_rollout(monkeypatch):
     )
     manager_cls = rollout.RolloutManager.__ray_metadata__.modified_class
     manager = object.__new__(manager_cls)
+    manager._engine_actor_states = ActorTableData.ActorState
     manager.servers = {"policy": server}
     manager.rollout_engine_lock = object()
     manager.status = "offload"
@@ -73,6 +83,7 @@ def test_legacy_rollout_discovery_retains_worker_diagnostics_even_when_offloaded
                             {
                                 "rank": 6 + rank,
                                 "status": "active",
+                                "actor_state": "ALIVE",
                                 "url": f"http://worker-{rank}.example:15000",
                                 "pid": 100 + rank,
                                 "node_id": f"node-{rank}",
@@ -85,6 +96,7 @@ def test_legacy_rollout_discovery_retains_worker_diagnostics_even_when_offloaded
             }
         },
         "total_engines": 4,
+        "observation": {"complete": True, "issues": []},
     }
 
 
@@ -95,5 +107,6 @@ def test_legacy_rollout_discovery_keeps_dead_worker_slot(legacy_rollout):
     snapshot = manager.get_engines_info("policy")
 
     workers = snapshot["models"]["policy"]["engine_groups"][0]["engines"]
-    assert workers[1] == {"rank": 7, "status": "dead"}
+    assert workers[1] == {"rank": 7, "status": "dead", "actor_state": "ABSENT"}
     assert len(workers) == snapshot["total_engines"] == 4
+    assert snapshot["observation"] == {"complete": True, "issues": []}
