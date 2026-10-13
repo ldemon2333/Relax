@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -71,8 +72,12 @@ def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
     assert controller._restart_mode == "global"
 
 
-@pytest.mark.parametrize("stopped_routers", [0, 1])
-def test_global_restart_stops_owned_router_before_deleting_serve(monkeypatch, stopped_routers):
+@pytest.mark.parametrize(
+    "actor_stopped, driver_stopped, actor_fails",
+    [(0, 0, False), (0, 1, False), (1, 0, False), (1, 1, False), (0, 1, True)],
+    ids=["external", "agentic-driver", "manager", "both", "manager-unavailable"],
+)
+def test_global_restart_cleans_both_router_owners(monkeypatch, actor_stopped, driver_stopped, actor_fails):
     events = []
     stop_ref = object()
     stop_remote = Mock(side_effect=lambda: events.append("stop router") or stop_ref)
@@ -97,12 +102,19 @@ def test_global_restart_stops_owned_router_before_deleting_serve(monkeypatch, st
 
     def get(ref, *, timeout):
         assert ref is stop_ref and timeout == 30
-        return stopped_routers
+        if actor_fails:
+            raise RuntimeError("Manager unavailable")
+        return actor_stopped
+
+    stop_driver = Mock(side_effect=lambda: events.append("stop driver router") or driver_stopped)
+    monkeypatch.setitem(
+        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_driver)
+    )
 
     monkeypatch.setattr(controller_module, "recovery_load_path", Mock())
     monkeypatch.setattr(controller_module, "run", lambda value: value)
     monkeypatch.setattr(controller_module.ray, "get", get)
-    monkeypatch.setattr(controller_module.ray, "shutdown", Mock())
+    monkeypatch.setattr(controller_module.ray, "shutdown", lambda: events.append("ray shutdown"))
     monkeypatch.setattr(controller_module.ray, "init", Mock())
     monkeypatch.setattr(controller_module.serve, "delete", lambda role: events.append(f"delete {role}"))
     monkeypatch.setattr(controller_module.serve, "shutdown", Mock())
@@ -110,15 +122,22 @@ def test_global_restart_stops_owned_router_before_deleting_serve(monkeypatch, st
     monkeypatch.setattr(controller_module.tq, "close", Mock())
     monkeypatch.setattr(controller_module, "shutdown_async_loop", Mock())
     monkeypatch.setattr(controller_module.time, "sleep", Mock())
-    monkeypatch.setattr(Controller, "__init__", lambda self, config, runtime_env: None)
+
+    def reinit(self, config, runtime_env):
+        events.append("reinit")
+        if actor_stopped + driver_stopped:
+            assert config.sglang_router_ip is None
+            assert config.sglang_router_port is None
+        else:
+            assert config.sglang_router_ip == "127.0.0.1"
+            assert config.sglang_router_port == 3000
+
+    monkeypatch.setattr(Controller, "__init__", reinit)
 
     controller._run_global_restart()
 
     stop_remote.assert_called_once_with()
+    stop_driver.assert_called_once_with()
     assert events.index("stop router") < events.index(f"delete {controller_module.ROLES.rollout}")
-    if stopped_routers:
-        assert config.sglang_router_ip is None
-        assert config.sglang_router_port is None
-    else:
-        assert config.sglang_router_ip == "127.0.0.1"
-        assert config.sglang_router_port == 3000
+    assert events.index("stop driver router") < events.index("ray shutdown") < events.index("reinit")
+    assert controller._restart_error is None

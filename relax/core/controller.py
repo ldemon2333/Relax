@@ -1162,6 +1162,17 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
+        # Agentic startup launches its Router in this driver process before
+        # creating RolloutManager, so actor-side disposal cannot stop it.
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            stopped_routers = stop_launched_routers()
+            if stopped_routers > 0:
+                logger.info(f"Terminated {stopped_routers} driver-owned Router(s) during shutdown")
+        except Exception as e:
+            logger.warning(f"Failed to stop driver-owned Routers during shutdown: {e}")
+
         try:
             self._cleanup_s3_model_weights_after_init(force=True)
         except Exception as e:
@@ -1369,6 +1380,7 @@ class Controller:
         self._cancel_pending_tasks()
 
         # --- 1.3 Tear down all service deployments ---
+        stopped_routers = 0
         for svc_role, service in self.serve_dict.items():
             try:
                 service._stop_heartbeat_thread()
@@ -1379,11 +1391,7 @@ class Controller:
             if svc_role == ROLES.rollout:
                 try:
                     rollout_manager = run(service.get_rollout_manager())
-                    stopped_routers = ray.get(rollout_manager.stop_owned_routers.remote(), timeout=30)
-                    if stopped_routers:
-                        self.config.sglang_router_ip = None
-                        self.config.sglang_router_port = None
-                        logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s), endpoint reset")
+                    stopped_routers += ray.get(rollout_manager.stop_owned_routers.remote(), timeout=30)
                 except Exception as e:
                     logger.warning(f"[Global Restart] Failed to stop RolloutManager Routers: {e}")
 
@@ -1405,6 +1413,19 @@ class Controller:
                 logger.warning(f"[Global Restart] Failed to delete metrics deployment: {e}")
 
         self._shutdown_agentic_rollout_services()
+
+        # The registry is process-local: agentic Routers belong to this driver,
+        # while other locally launched Rollout Routers belong to the Manager.
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            stopped_routers += stop_launched_routers()
+        except Exception as e:
+            logger.warning(f"[Global Restart] Failed to stop driver-owned Routers: {e}")
+        if stopped_routers > 0:
+            self.config.sglang_router_ip = None
+            self.config.sglang_router_port = None
+            logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s), endpoint reset")
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

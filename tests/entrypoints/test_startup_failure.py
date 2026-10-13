@@ -381,7 +381,7 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-def test_controller_partial_startup_cleans_teacher_without_local_router_cleanup(monkeypatch):
+def test_controller_partial_startup_cleans_teacher_and_driver_routers(monkeypatch):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
@@ -401,14 +401,15 @@ def test_controller_partial_startup_cleans_teacher_without_local_router_cleanup(
     )
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
-    stop_routers.assert_not_called()
+    stop_routers.assert_called_once_with()
 
 
-def test_controller_shutdown_disposes_router_in_rollout_manager(monkeypatch):
+@pytest.mark.parametrize("manager_fails", [False, True])
+def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manager_fails):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
-    stop_routers = Mock()
+    stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
@@ -416,7 +417,7 @@ def test_controller_shutdown_disposes_router_in_rollout_manager(monkeypatch):
     dispose_remote = Mock(return_value=dispose_ref)
     manager = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_remote))
     service = SimpleNamespace(get_rollout_manager=Mock(return_value=manager))
-    ray_get = Mock(return_value=None)
+    ray_get = Mock(side_effect=RuntimeError("Manager unavailable") if manager_fails else None)
     ns = {
         "logger": Mock(),
         "ROLES": SimpleNamespace(rollout="rollout"),
@@ -436,4 +437,4 @@ def test_controller_shutdown_disposes_router_in_rollout_manager(monkeypatch):
 
     dispose_remote.assert_called_once_with()
     ray_get.assert_called_once_with(dispose_ref, timeout=30)
-    stop_routers.assert_not_called()
+    stop_routers.assert_called_once_with()
