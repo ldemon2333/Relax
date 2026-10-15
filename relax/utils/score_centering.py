@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
+import pybase64
 
 from relax.utils.types import Sample
 
@@ -80,6 +81,15 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
         )
     if filtered and getattr(args, "sglang_sampling_backend", None) == "ascend":
         raise ValueError("SGLang ascend sampling does not return the sampling support required to recover behavior q")
+    if float(sampling["top_p"]) < 1 and getattr(args, "sglang_sampling_backend", None) != "pytorch":
+        # FlashInfer switches to sequential top-k/top-p renormalization when
+        # ANY request enables min-p, but SGLang reports joint-filter support.
+        # Checking only this request's min_p cannot ensure truthful behavior q.
+        raise ValueError(
+            "Score Centering top-p filtering requires --sglang-sampling-backend pytorch: "
+            "SGLang's batch-level min-p path can return incorrect behavior support with FlashInfer, "
+            "even for a request with min_p=0; alternatively set top_p=1"
+        )
     payload["sampling_params"] = sampling
     payload["return_logprob"] = True
     payload["top_logprobs_num"] = k
@@ -87,6 +97,17 @@ def configure_score_centering_request(args: Any, payload: dict[str, Any]) -> str
     if filtered:
         payload["return_sampling_mask"] = True
     return "support" if filtered else "selected"
+
+
+def _decode_logprob_pairs(meta_info: Mapping[str, Any], prefix: str) -> list[tuple[float, int]]:
+    values = np.frombuffer(pybase64.b64decode(meta_info[f"{prefix}_val_b64"], validate=True), dtype=np.float32)
+    encoded_ids = meta_info.get(f"{prefix}_idx_b64")
+    if encoded_ids is None:
+        raise ValueError(f"Score Centering requires {prefix}_idx_b64 alongside encoded probabilities")
+    ids = np.frombuffer(pybase64.b64decode(encoded_ids, validate=True), dtype=np.int32)
+    if values.size != ids.size:
+        raise ValueError(f"Score Centering {prefix} encoded values and token IDs differ in length")
+    return list(zip(values.tolist(), ids.tolist(), strict=True))
 
 
 def _validate_rows(
@@ -150,6 +171,8 @@ def parse_score_centering_response(
     if k <= 0 or (vocab_size is not None and k > vocab_size):
         raise ValueError("Score Centering candidate count must lie in [1, real vocabulary size]")
     sampled_rows = meta_info.get("output_token_logprobs")
+    if sampled_rows is None and "output_token_logprobs_val_b64" in meta_info:
+        sampled_rows = _decode_logprob_pairs(meta_info, "output_token_logprobs")
     if sampled_rows is None:
         if expected_tokens is not None and len(expected_tokens) == 0:
             sampled_rows = []
@@ -169,6 +192,11 @@ def parse_score_centering_response(
     ids = np.full((n, k), -1, dtype=np.int32)
     logprobs = np.full((n, k), -np.inf, dtype=np.float32)
     rows = meta_info.get("output_top_logprobs")
+    if rows is None and "output_top_logprobs_val_b64" in meta_info:
+        entries = _decode_logprob_pairs(meta_info, "output_top_logprobs")
+        if len(entries) != n * k or meta_info.get("output_top_logprobs_k") != [k] * n:
+            raise ValueError("Score Centering encoded output_top_logprobs must contain exactly K entries per token")
+        rows = [entries[start : start + k] for start in range(0, len(entries), k)]
     if n and (rows is None or len(rows) != n):
         raise ValueError("Score Centering requires output_top_logprobs for every generated token")
     if rows is not None and len(rows) != n:

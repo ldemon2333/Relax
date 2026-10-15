@@ -40,7 +40,7 @@ Relax 框架集成了多种策略梯度算法，均通过 `--advantage-estimator
 
 SC 从 sampled-token 的 score 中减去生成分布下的平均 score，修正 rollout 分布与当前训练分布不一致时的策略梯度漂移。这里的 score 指 `∇θ log pθ`，不是 reward；实现记录生成时的 top-K 候选概率，并近似未记录的尾部贡献。
 
-`score_centering` 预设使用组内 reward 减均值、不除组内标准差，再将 advantage 广播到 response token。策略 loss 支持内部 `none/tis/mis` importance weighting，不使用 PPO clipping。
+**默认 SC 使用组内减均值、不除标准差的 advantage 模式。** 这与[原作者实现的默认 `group_centered` 配置](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/train_rl.py#L53-L58)一致：[原实现](https://github.com/martin-marek/score-centering/blob/7c56e9ee2972aa57f446cf564de1a1658d14b321/losses.py#L107-L124)保持对齐。Relax 的 `score_centering` 预设据此采用 `group_mean`。
 
 可从现有 text-only Megatron GRPO recipe 切换，包含原生单轮、文本 Agentic/自定义多轮与 partial rollout；文本工具调用及工具返回仍属于 text-only 范围。沿用 recipe 的 Colocate、Hybrid、Fully Async 和 TP/DP/PP/CP 配置，工具观测 token 沿用现有 loss mask。自定义生成或数据转换函数须保留 sampled log-q 以及对齐的 `rollout_topk_token_ids`、`rollout_topk_log_probs`；当前 FSDP diffusion 训练入口不属于该文本 token loss 路径。
 
@@ -212,6 +212,8 @@ bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 
 `--rollout-top-logprobs-num` 控制 SC 的候选记录量，现有 `--rollout-top-k` 控制采样过滤，两者独立。增大 K 会增加存储、传输与评分开销，并减少依赖尾部近似的范围，不保证训练收益单调提高。尾部概率计算使用固定 `1e-6` floor，没有额外 epsilon 参数。
 
+固定 K 的候选记录加尾部近似不等于完整截断 support replay。生成端的 support 信息仅用于恢复真实 behavior q；训练端仍在完整模型词表上计算 p，不按生成 support 重放过滤或重新归一化。
+
 SC 还需遵守以下已有参数约束：
 
 | 配置                                                          | SC 要求                                                         |
@@ -229,7 +231,11 @@ SC 还需遵守以下已有参数约束：
 
 OPD 通过修改 advantage 注入的蒸馏信号也会被 SC 中心化，尤其 top-K OPD 的更新可能因此抵消。独立 OPD loss 不必然被中心化，但首期同样不开放组合。OPD 关闭时，其默认 `opd_kl_coef=1.0` 不生效，无需为启用 SC 单独改成 0。
 
-生成端必须返回实际采样分布的概率。当前采集路径要求每次调用的温度与 `--rollout-temperature` 一致，且有限、不小于 `1e-6`；非 1 温度下应保持 `SGLANG_RETURN_ORIGINAL_LOGPROB=0`。使用 top-p/min-p 过滤时还需设置有限的 sampling top-k，以取得 SGLang 的 support 信息；当前不接受 speculative decoding、`sglang_rl_on_policy_target`，以及 Ascend backend 的过滤采样，因为对应接口不能提供此路径所需的 behavior q。Relax 的 `--true-on-policy-mode` 仍可使用。
+生成端必须返回实际采样分布的概率，支持普通列表和 `RELAX_FORCE_LOGPROBS_BASE64=1` 的编码字段。当前采集路径要求每次调用的温度与 `--rollout-temperature` 一致，且有限、不小于 `1e-6`；非 1 温度下应保持 `SGLANG_RETURN_ORIGINAL_LOGPROB=0`。
+
+使用 top-p/min-p 过滤时还需设置有限的 sampling top-k，以取得 SGLang 的 support 信息。`top_p < 1` 还要求显式设置 `--sglang-sampling-backend pytorch`；SGLang v0.5.17 的 FlashInfer min-p 分支依次归一化 top-k/top-p，但返回的 support 按原始概率联合过滤，二者可能不一致。该分支由 batch 内任意请求的 min-p 开启，因此单个请求的 `min_p=0` 也不能规避；可改用 PyTorch 后端，或保持 `top_p=1`。`top_p=1` 下仍支持 FlashInfer 的有限 top-k 和 min-p。
+
+当前不接受 speculative decoding、`sglang_rl_on_policy_target`，以及 Ascend backend 的过滤采样，因为对应接口不能提供此路径所需的 behavior q。Relax 的 `--true-on-policy-mode` 仍可使用。
 
 ### RLOO 专用约束与指标
 
@@ -355,6 +361,7 @@ examples/algorithms/
 
 - [Relax 算法文档](../../docs/en/examples/algorithms.md)
 - [GRPO - DeepSeekMath](https://arxiv.org/abs/2402.03300)
+- [SC - Score Centering Stabilizes Off-policy Reinforcement Learning](https://arxiv.org/abs/2609.20807)
 - [CISPO - MiniMax-M1](https://arxiv.org/abs/2506.13585)
 - [PPO - Proximal Policy Optimization](https://arxiv.org/abs/1707.06347)
 - [REINFORCE++ - Simple Efficient Alignment](https://arxiv.org/abs/2501.03262)
