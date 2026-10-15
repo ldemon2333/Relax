@@ -1137,6 +1137,21 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _dispose_rollout_manager(self, lookup_timeout: float = 5.0, dispose_timeout: float = 35.0) -> bool:
+        """Ask the owning actor to release engines and routers before deleting
+        its deployment."""
+        service = self.serve_dict.get(ROLES.rollout)
+        if service is None:
+            return True
+        try:
+            rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=lookup_timeout))
+            ray.get(rollout_manager.dispose.remote(), timeout=dispose_timeout)
+            logger.info("RolloutManager disposal completed in its owning actor.")
+            return True
+        except Exception as e:
+            logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
+            return False
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1149,14 +1164,7 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
-        # Dispose actor-owned Routers and rollout engines in RolloutManager.
-        if ROLES.rollout in self.serve_dict:
-            try:
-                rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
-                ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — Routers and SGLang engines shut down.")
-            except Exception as e:
-                logger.warning(f"Failed to dispose RolloutManager: {e}")
+        self._dispose_rollout_manager()
 
         shutdown_managed_opd_teacher(self._teacher_manager)
 
@@ -1379,21 +1387,16 @@ class Controller:
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
 
+        # The rollout actor owns router subprocesses; dispose before deleting its handle.
+        self._dispose_rollout_manager()
+
         # --- 1.3 Tear down all service deployments ---
-        stopped_routers = 0
         for svc_role, service in self.serve_dict.items():
             try:
                 service._stop_heartbeat_thread()
                 logger.info(f"[Global Restart] Stopped heartbeat for '{svc_role}'")
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to stop heartbeat for '{svc_role}': {e}")
-
-            if svc_role == ROLES.rollout:
-                try:
-                    rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=30))
-                    stopped_routers += ray.get(rollout_manager.stop_owned_routers.remote(), timeout=30)
-                except Exception as e:
-                    logger.warning(f"[Global Restart] Failed to stop RolloutManager Routers: {e}")
 
             try:
                 serve.delete(svc_role)
@@ -1421,7 +1424,6 @@ class Controller:
             from relax.distributed.ray.rollout import stop_launched_routers
 
             driver_stopped_routers = stop_launched_routers()
-            stopped_routers += driver_stopped_routers
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to stop driver-owned Routers: {e}")
         # Only driver-launched primary Routers are cached in Controller config.
@@ -1429,8 +1431,7 @@ class Controller:
         if driver_stopped_routers > 0:
             self.config.sglang_router_ip = None
             self.config.sglang_router_port = None
-        if stopped_routers > 0:
-            logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s)")
+            logger.info(f"[Global Restart] Terminated {driver_stopped_routers} driver-owned Router(s), endpoint reset")
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

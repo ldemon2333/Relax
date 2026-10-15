@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 
 
 @pytest.mark.parametrize("shutdown_fails", [False, True])
-def test_rollout_manager_dispose_stops_owned_router_before_engine_shutdown(monkeypatch, shutdown_fails):
+def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fails(monkeypatch, shutdown_fails):
     from relax.distributed.ray import rollout
 
     process = multiprocessing.Process(target=time.sleep, args=(30,))
@@ -22,7 +22,7 @@ def test_rollout_manager_dispose_stops_owned_router_before_engine_shutdown(monke
     monkeypatch.setattr(rollout, "_LAUNCHED_ROUTER_PROCESSES", [process])
 
     def shutdown_engines():
-        assert not process.is_alive()
+        assert process.is_alive()
         if shutdown_fails:
             raise RuntimeError("engine shutdown failed")
 
