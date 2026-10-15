@@ -1390,7 +1390,7 @@ class Controller:
 
             if svc_role == ROLES.rollout:
                 try:
-                    rollout_manager = run(service.get_rollout_manager())
+                    rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=30))
                     stopped_routers += ray.get(rollout_manager.stop_owned_routers.remote(), timeout=30)
                 except Exception as e:
                     logger.warning(f"[Global Restart] Failed to stop RolloutManager Routers: {e}")
@@ -1416,16 +1416,21 @@ class Controller:
 
         # The registry is process-local: agentic Routers belong to this driver,
         # while other locally launched Rollout Routers belong to the Manager.
+        driver_stopped_routers = 0
         try:
             from relax.distributed.ray.rollout import stop_launched_routers
 
-            stopped_routers += stop_launched_routers()
+            driver_stopped_routers = stop_launched_routers()
+            stopped_routers += driver_stopped_routers
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to stop driver-owned Routers: {e}")
-        if stopped_routers > 0:
+        # Only driver-launched primary Routers are cached in Controller config.
+        # Manager-owned auxiliary Routers can coexist with an external primary.
+        if driver_stopped_routers > 0:
             self.config.sglang_router_ip = None
             self.config.sglang_router_port = None
-            logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s), endpoint reset")
+        if stopped_routers > 0:
+            logger.info(f"[Global Restart] Terminated {stopped_routers} Router(s)")
 
         # --- 1.5 Tear down autoscaler deployment ---
         if self._autoscaler_config is not None:

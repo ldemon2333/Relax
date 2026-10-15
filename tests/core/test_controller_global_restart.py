@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import sys
 import threading
 from types import SimpleNamespace
@@ -73,20 +74,55 @@ def test_restart_cycle_ack_is_published_after_old_state_is_cleared():
 
 
 @pytest.mark.parametrize(
-    "actor_stopped, driver_stopped, actor_fails",
-    [(0, 0, False), (0, 1, False), (1, 0, False), (1, 1, False), (0, 1, True)],
-    ids=["external", "agentic-driver", "manager", "both", "manager-unavailable"],
+    "actor_stopped, driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip",
+    [
+        (0, 0, False, False, "external-router.example", "external-router.example"),
+        (0, 1, False, False, "127.0.0.1", None),
+        (1, 0, False, False, None, None),
+        (1, 1, False, False, "127.0.0.1", None),
+        (0, 1, True, False, "127.0.0.1", None),
+        (0, 1, False, True, "127.0.0.1", None),
+        (1, 0, False, False, "external-router.example", "external-router.example"),
+    ],
+    ids=[
+        "external",
+        "agentic-driver",
+        "manager",
+        "both",
+        "manager-unavailable",
+        "manager-query-pending",
+        "external-primary-local-auxiliary",
+    ],
 )
-def test_global_restart_cleans_both_router_owners(monkeypatch, actor_stopped, driver_stopped, actor_fails):
+def test_global_restart_cleans_both_router_owners(
+    monkeypatch, actor_stopped, driver_stopped, actor_fails, manager_pending, initial_router_ip, expected_router_ip
+):
     events = []
     stop_ref = object()
     stop_remote = Mock(side_effect=lambda: events.append("stop router") or stop_ref)
     manager = SimpleNamespace(stop_owned_routers=SimpleNamespace(remote=stop_remote))
+
+    async def get_rollout_manager():
+        if manager_pending:
+            pending = asyncio.get_running_loop().create_future()
+            # Release on regressions so a missing timeout fails instead of hanging pytest.
+            watchdog = asyncio.get_running_loop().call_later(1, pending.set_result, None)
+            try:
+                await pending
+            except asyncio.CancelledError:
+                events.append("manager query cancelled")
+                raise
+            finally:
+                watchdog.cancel()
+        return manager
+
     service = SimpleNamespace(
         _stop_heartbeat_thread=Mock(),
-        get_rollout_manager=Mock(return_value=manager),
+        get_rollout_manager=get_rollout_manager,
     )
-    config = SimpleNamespace(sglang_router_ip="127.0.0.1", sglang_router_port=3000)
+    config = SimpleNamespace(
+        sglang_router_ip=initial_router_ip, sglang_router_port=3000 if initial_router_ip else None
+    )
     controller = object.__new__(Controller)
     controller.config = config
     controller.runtime_env = {}
@@ -99,6 +135,16 @@ def test_global_restart_cleans_both_router_owners(monkeypatch, actor_stopped, dr
     controller._autoscaler_config = None
     controller._shutdown_agentic_rollout_services = Mock()
     controller._restart_error = None
+    controller._restart_done_event = threading.Event()
+
+    if manager_pending:
+        wait_for = asyncio.wait_for
+
+        async def short_wait_for(awaitable, *, timeout):
+            assert timeout == 30
+            return await wait_for(awaitable, timeout=0.01)
+
+        monkeypatch.setattr(controller_module.asyncio, "wait_for", short_wait_for)
 
     def get(ref, *, timeout):
         assert ref is stop_ref and timeout == 30
@@ -112,7 +158,6 @@ def test_global_restart_cleans_both_router_owners(monkeypatch, actor_stopped, dr
     )
 
     monkeypatch.setattr(controller_module, "recovery_load_path", Mock())
-    monkeypatch.setattr(controller_module, "run", lambda value: value)
     monkeypatch.setattr(controller_module.ray, "get", get)
     monkeypatch.setattr(controller_module.ray, "shutdown", lambda: events.append("ray shutdown"))
     monkeypatch.setattr(controller_module.ray, "init", Mock())
@@ -120,24 +165,24 @@ def test_global_restart_cleans_both_router_owners(monkeypatch, actor_stopped, dr
     monkeypatch.setattr(controller_module.serve, "shutdown", Mock())
     monkeypatch.setattr(controller_module.serve, "start", Mock())
     monkeypatch.setattr(controller_module.tq, "close", Mock())
-    monkeypatch.setattr(controller_module, "shutdown_async_loop", Mock())
     monkeypatch.setattr(controller_module.time, "sleep", Mock())
 
     def reinit(self, config, runtime_env):
         events.append("reinit")
-        if actor_stopped + driver_stopped:
-            assert config.sglang_router_ip is None
-            assert config.sglang_router_port is None
-        else:
-            assert config.sglang_router_ip == "127.0.0.1"
-            assert config.sglang_router_port == 3000
+        assert config.sglang_router_ip == expected_router_ip
+        assert config.sglang_router_port == (3000 if expected_router_ip else None)
 
     monkeypatch.setattr(Controller, "__init__", reinit)
 
-    controller._run_global_restart()
+    controller._global_restart()
 
-    stop_remote.assert_called_once_with()
+    if manager_pending:
+        stop_remote.assert_not_called()
+        assert events.index("manager query cancelled") < events.index(f"delete {controller_module.ROLES.rollout}")
+    else:
+        stop_remote.assert_called_once_with()
+        assert events.index("stop router") < events.index(f"delete {controller_module.ROLES.rollout}")
     stop_driver.assert_called_once_with()
-    assert events.index("stop router") < events.index(f"delete {controller_module.ROLES.rollout}")
     assert events.index("stop driver router") < events.index("ray shutdown") < events.index("reinit")
     assert controller._restart_error is None
+    assert controller._restart_done_event.is_set()
