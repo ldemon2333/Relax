@@ -20,7 +20,6 @@ from relax.utils.distributed_utils import distributed_masked_normalize, distribu
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
-    compute_log_probs_on_topk_token_ids,
     compute_opd_topk_log_probs,
     compute_policy_opd_loss,
     resolve_opd_gather_topk_token_ids,
@@ -51,6 +50,11 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
+)
+from .score_centering import (
+    align_score_centering_candidate_ids,
+    build_score_centering_context,
+    get_score_centering_chunk,
 )
 
 
@@ -327,65 +331,6 @@ def _allgather_cp_redistribute(
         res[key] = new_values
 
 
-def _score_centering_vocab_logits(logits: torch.Tensor, args: Namespace) -> torch.Tensor:
-    """Exclude TP padding from the distribution used by SC and its
-    regularizers."""
-    vocab_size = getattr(args, "score_centering_vocab_size", None)
-    if vocab_size is None or vocab_size <= 0:
-        raise ValueError("Score centering requires the model's unpadded vocabulary size.")
-    tp_rank = mpu.get_tensor_model_parallel_rank()
-    vocab_ids = torch.arange(logits.size(-1), device=logits.device) + tp_rank * logits.size(-1)
-    # A finite floor has zero softmax mass in fp32 and keeps the existing entropy
-    # kernel's p * logits finite on padded entries (0 * -inf would be NaN).
-    return logits.masked_fill(vocab_ids >= vocab_size, torch.finfo(logits.dtype).min)
-
-
-def _score_centering_allgather_candidate_ids(
-    token_ids: list[torch.Tensor],
-    *,
-    logits: torch.Tensor,
-    args: Namespace,
-    total_lengths: list[int],
-    response_lengths: list[int],
-    max_seq_lens: list[int] | None,
-    padded_total_lengths: list[int] | None,
-    dynamic_cp_size: int | None,
-    dynamic_cp_rank: int | None,
-) -> list[torch.Tensor]:
-    """Match ring-layout candidate rows to the contiguous allgather-CP
-    logits."""
-    cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
-    cp_group = (
-        mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
-        if dynamic_cp_size is not None
-        else None
-    )
-    chunk_start = cp_rank * logits.size(1)
-    chunk_end = chunk_start + logits.size(1)
-    aligned_ids: list[torch.Tensor] = []
-    seq_start = 0
-    for i, (ids, total_length, response_length) in enumerate(
-        zip(token_ids, total_lengths, response_lengths, strict=True)
-    ):
-        full_ids = all_gather_with_cp(
-            ids,
-            total_length,
-            response_length,
-            padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
-            qkv_format=args.qkv_format,
-            max_seq_len=max_seq_lens[i] if max_seq_lens is not None else None,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-            dynamic_cp_group=cp_group,
-        )
-        response_start = seq_start + total_length - response_length - 1
-        start = max(response_start, chunk_start)
-        end = min(seq_start + total_length - 1, chunk_end)
-        aligned_ids.append(full_ids[start - response_start : end - response_start] if end > start else full_ids[:0])
-        seq_start += total_length
-    return aligned_ids
-
-
 def get_log_probs_and_entropy(
     logits: torch.Tensor,
     *,
@@ -466,8 +411,8 @@ def get_log_probs_and_entropy(
     sc_cp_size = dynamic_cp_size
     if is_score_centering and sc_cp_size is None:
         sc_cp_size = mpu.get_context_parallel_world_size()
-    if is_score_centering and gather_topk_token_ids is not None and args.allgather_cp and sc_cp_size > 1:
-        gather_topk_token_ids = _score_centering_allgather_candidate_ids(
+    if is_score_centering:
+        gather_topk_token_ids = align_score_centering_candidate_ids(
             gather_topk_token_ids,
             logits=logits,
             args=args,
@@ -508,7 +453,23 @@ def get_log_probs_and_entropy(
         )
     ):
         if is_score_centering:
-            logits_chunk = _score_centering_vocab_logits(logits_chunk, args)
+            chunk = get_score_centering_chunk(
+                logits_chunk,
+                tokens_chunk,
+                tp_group,
+                args=args,
+                candidate_ids=gather_topk_token_ids[sample_idx] if gather_topk_token_ids is not None else None,
+                with_entropy=with_entropy,
+                with_topk=with_topk,
+                topk_k=resolved_topk_k,
+            )
+            log_probs_list.append(chunk["log_probs"])
+            entropy_list.append(chunk["entropy"])
+            if with_topk:
+                topk_token_ids_list.append(chunk["topk_token_ids"])
+            if gather_topk_token_ids is not None:
+                topk_log_probs_list.append(chunk["topk_log_probs"])
+            continue
         if lm_head_forward is not None:
             # SFT chunked: logits_chunk is per-sample hidden_states [R, H].
             # Run lm_head per sub-chunk so the full [R, V/TP] logits tensor
@@ -549,13 +510,6 @@ def get_log_probs_and_entropy(
             )
             log_prob = log_prob.squeeze(-1)
 
-        if is_score_centering and logits_chunk.size(0) == 0:
-            # Every CP rank must enter the differentiable redistribution backward,
-            # including ranks owning no response positions for this sample.
-            log_prob = log_prob + 0 * logits_chunk.sum()
-            if with_entropy_grad:
-                entropy = entropy + 0 * logits_chunk.sum()
-
         log_probs_list.append(log_prob)
         entropy_list.append(entropy)
 
@@ -564,15 +518,7 @@ def get_log_probs_and_entropy(
             topk_token_ids_list.append(torch.topk(logits_chunk, k=k, dim=-1).indices)
 
         if gather_topk_token_ids is not None:
-            if is_score_centering:
-                selected = compute_log_probs_on_topk_token_ids(
-                    logits_chunk, gather_topk_token_ids[sample_idx], tp_group
-                )
-                if logits_chunk.size(0) == 0:
-                    selected = selected + 0 * logits_chunk.sum()
-                topk_log_probs_list.append(selected)
-            else:
-                topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
+            topk_log_probs_list.append(compute_opd_topk_log_probs(logits_chunk, gather_topk_token_ids, sample_idx))
 
     res = {
         "log_probs": log_probs_list,
@@ -1096,36 +1042,14 @@ def policy_loss_function(
 
     policy_kwargs: dict[str, dict[str, torch.Tensor]] = {}
     if is_score_centering:
-        # batch loss_masks remain full-response even when probability fields are
-        # CP-local. Use the same response offsets as sampled/head probabilities.
-        local_masks = [
-            slice_log_prob_with_cp(
-                mask,
-                total_length,
-                response_length,
-                args.qkv_format,
-                max_seq_lens[i] if max_seq_lens is not None else None,
-                padded_total_lengths[i] if padded_total_lengths is not None else None,
-                dynamic_cp_size=batch.get("dynamic_cp_size", None),
-                dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
-            )
-            for i, (mask, total_length, response_length) in enumerate(
-                zip(batch["loss_masks"], total_lengths, response_lengths, strict=True)
-            )
-        ]
-        sc_loss_mask = torch.cat(local_masks).to(device=log_probs.device)
-        sc_valid = sc_loss_mask != 0
+        sc_context = build_score_centering_context(args, batch, log_probs_and_entropy)
+        sc_valid = sc_context["loss_mask"] != 0
         # Observation and padding rows may contain -inf behavior placeholders.
         # Sanitize before both the objective and ordinary diagnostic/reward math.
         log_probs = torch.where(sc_valid, log_probs, 0)
         old_log_probs = torch.where(sc_valid, old_log_probs, 0)
         ppo_kl = old_log_probs - log_probs
-        policy_kwargs["score_centering_context"] = {
-            "rollout_log_probs": torch.cat(batch["rollout_log_probs"]),
-            "rollout_topk_log_probs": torch.cat(batch["rollout_topk_log_probs"]),
-            "train_topk_log_probs": torch.cat(log_probs_and_entropy["topk_log_probs"]),
-            "loss_mask": sc_loss_mask,
-        }
+        policy_kwargs["score_centering_context"] = sc_context
 
     pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
         args,

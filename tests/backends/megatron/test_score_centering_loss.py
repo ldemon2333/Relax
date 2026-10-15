@@ -32,7 +32,7 @@ def _backend(monkeypatch, *, rank=0, cp_size=1, tp_size=1):
     # Restore both import caches: first imports under the stub must not leave
     # fake process groups in later tests, including real Megatron GPU tests.
     parent = importlib.import_module("relax.backends.megatron")
-    for leaf in ("loss", "cp_utils"):
+    for leaf in ("loss", "cp_utils", "score_centering"):
         name = f"relax.backends.megatron.{leaf}"
         monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
         sys.modules.pop(name)
@@ -102,7 +102,7 @@ def _args(**overrides):
 def test_score_centering_backend_restores_import_caches(monkeypatch, already_imported):
     parent = importlib.import_module("relax.backends.megatron")
     originals = {}
-    for leaf in ("loss", "cp_utils"):
+    for leaf in ("loss", "cp_utils", "score_centering"):
         name = f"relax.backends.megatron.{leaf}"
         if already_imported:
             originals[leaf] = ModuleType(name)
@@ -117,9 +117,10 @@ def test_score_centering_backend_restores_import_caches(monkeypatch, already_imp
         loss, cp = _backend(isolated)
         assert loss.mpu is cp.mpu is sys.modules["megatron.core"].mpu
         assert parent.loss is loss and parent.cp_utils is cp
+        assert parent.score_centering.mpu is loss.mpu
         assert callable(loss.get_log_probs_and_entropy)
 
-    for leaf in ("loss", "cp_utils"):
+    for leaf in ("loss", "cp_utils", "score_centering"):
         name = f"relax.backends.megatron.{leaf}"
         if already_imported:
             assert sys.modules[name] is originals[leaf]
