@@ -80,9 +80,7 @@ def sglang_engine_module(monkeypatch):
         router_worker_base_url=lambda host, port, worker_id: f"http://{host}:{port}/workers/{worker_id}",
         extra_env={
             "RELAX_OPTIMIZE_ROUTING_REPLAY": False,
-            "RELAX_OPD_PREEXPANDED_PATCH": False,
             "RELAX_OPD_PER_POS_TOKEN_IDS": False,
-            "RELAX_OPD_TOKEN_IDS_LOGPROB_K": "0",
             "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES": 512 * 1024**2,
         },
     ) as module:

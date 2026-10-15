@@ -22,7 +22,7 @@ def stubbed_sglang_engine_module(
     cache."""
     with monkeypatch.context() as patch:
         ray = ModuleType("ray")
-        ray.get_runtime_context = lambda: SimpleNamespace()
+        ray.get_runtime_context = lambda: SimpleNamespace(get_actor_id=lambda: "replacement-actor")
         patch.setitem(sys.modules, "ray", ray)
 
         sglang_router = ModuleType("sglang_router")

@@ -16,7 +16,9 @@ def service_module():
 
 @pytest.fixture
 def allocation(service_module, monkeypatch):
-    module = service_module
+    from relax.distributed.ray import placement_group
+
+    module = placement_group
     runtime = SimpleNamespace(
         pg=SimpleNamespace(ready=lambda: "ready"),
         probes=[],
@@ -116,7 +118,9 @@ def test_pg_allocation_failure_cleans_all_probe_actors_and_owned_pg(service_modu
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
 def test_pg_invalid_deadline_rejects_before_allocation(service_module, monkeypatch, timeout):
     create = MagicMock()
-    monkeypatch.setattr(service_module, "placement_group", create)
+    from relax.distributed.ray import placement_group
+
+    monkeypatch.setattr(placement_group, "placement_group", create)
     with pytest.raises(ValueError, match="timeout"):
         service_module.create_placement_group(1, timeout_s=timeout)
     create.assert_not_called()

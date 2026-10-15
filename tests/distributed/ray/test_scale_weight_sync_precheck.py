@@ -423,6 +423,11 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
         patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        # Reward-test collection can initialize a CPU-only Ray runtime.
+        patch(
+            "relax.backends.sglang.sglang_engine.device_utils.get_visible_devices_env_var",
+            return_value="CUDA_VISIBLE_DEVICES",
+        ),
         patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
     ):
         result = engine.run_scale_weight_sync_precheck(

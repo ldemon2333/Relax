@@ -170,7 +170,7 @@ async def test_external_teacher_keeps_legacy_url_transport_without_discovery(mon
     manager = module.OpdManager(_args(_inference_teacher_discovery_url=None))
     calls = []
 
-    async def post(session, url, payload, sample, err_tag):
+    async def post(session, url, payload, sample, err_tag, expected_input_ids=None):
         calls.append(url)
         return module.opd_main_worker.LogprobResponse(
             {"meta_info": {"input_token_logprobs": [[0, 1], [-1, 2], [-2, 3]]}}

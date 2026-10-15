@@ -485,9 +485,10 @@ class InferenceManager:
                             refs.append((group, index, engine, engine.shutdown.remote()))
                         except Exception as exc:
                             errors.append(guard.failed(engine, exc))
+            deadline = time.monotonic() + timeout
             for group, index, engine, ref in refs:
                 try:
-                    result = ray.get(ref, timeout=timeout)
+                    result = ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
                     if result is False:
                         raise InferenceCleanupError("Engine rejected shutdown")
                     ray.kill(engine)

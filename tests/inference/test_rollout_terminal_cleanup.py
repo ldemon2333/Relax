@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from relax.distributed.ray import inference_manager as core
+from relax.distributed.ray.rollout_scale_types import ScaleOutRequest, ScaleOutStatus
 from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.logging_utils import get_logger
 
@@ -38,8 +39,11 @@ def rollout_methods():
         "InferenceRecoveryRequired": core.InferenceRecoveryRequired,
         "get_engine_shutdown_guard": core.get_engine_shutdown_guard,
         "require_probe_cleanup": core.require_probe_cleanup,
+        "ScaleOutRequest": ScaleOutRequest,
+        "ScaleOutStatus": ScaleOutStatus,
+        "stop_launched_routers": lambda: None,
     }
-    nodes = [definitions[name] for name in ("ScaleOutStatus", "ScaleOutRequest", "EngineGroupLifecycle")]
+    nodes = [definitions["EngineGroupLifecycle"]]
     for class_name, names in {
         "EngineGroup": {"shutdown_engines", "reconcile_terminal_engines"},
         "RolloutServer": {"recover"},
@@ -308,8 +312,10 @@ def test_dispose_allows_terminal_requests_and_stops_recovery(rollout_methods, ru
 
     assert manager._disposing is True
     assert owner._stopping is True
-    manager._stop_eviction_monitor.assert_called_once_with()
-    manager._health_monitors[0].stop.assert_called_once_with()
+    for stop in (manager._stop_eviction_monitor, manager._health_monitors[0].stop):
+        assert stop.call_count == 2
+        assert stop.call_args_list[0].kwargs == {"timeout": 0.0}
+        assert 0.0 <= stop.call_args_list[1].kwargs["timeout"] <= 5.0
     manager._shutdown_all_engines.assert_called_once_with()
     with pytest.raises(core.InferenceRecoveryRequired, match="shutdown has started"):
         owner.recover_rollout()

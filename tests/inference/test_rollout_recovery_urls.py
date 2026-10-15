@@ -17,6 +17,7 @@ from typing import Any, Optional
 import pytest
 
 from relax.distributed.ray import inference_manager as core
+from relax.distributed.ray.rollout_scale_types import ScaleInRequest, ScaleInStatus
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.utils import scale_utils
 from relax.utils.http_utils import _wrap_ipv6
@@ -112,8 +113,6 @@ def rollout_module(runtime):
     nodes = [
         definitions[name]
         for name in (
-            "ScaleInStatus",
-            "ScaleInRequest",
             "ScaleResult",
             "EngineGroupLifecycle",
             "_EngineInitRecord",
@@ -158,6 +157,8 @@ def rollout_module(runtime):
         "EngineShutdownGuard": core.EngineShutdownGuard,
         "InferenceCleanupError": core.InferenceCleanupError,
         "InferenceRecoveryRequired": core.InferenceRecoveryRequired,
+        "ScaleInRequest": ScaleInRequest,
+        "ScaleInStatus": ScaleInStatus,
         "scale_utils": scale_utils,
         "PrecheckProbeCategory": scale_utils.PrecheckProbeCategory,
         "ScaleOutFailure": scale_utils.ScaleOutFailure,

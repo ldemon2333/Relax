@@ -299,3 +299,23 @@ def test_late_soft_health_error_cannot_kill_replacement(monkeypatch):
     assert m._engine_group.all_engines == [replacement]
     m._kill_engine.assert_not_called()
     assert not m._consecutive_failures
+
+
+def test_bounded_stop_retains_live_thread_state_until_cleanup_finishes():
+    monitor = _monitor()
+    thread = mock.Mock()
+    thread.is_alive.return_value = True
+    monitor._thread = thread
+    monitor._stop_event = threading.Event()
+    monitor._pause_event = threading.Event()
+    monitor._pause_event.set()
+    monitor._is_checking_enabled = True
+
+    monitor.stop(timeout=0.0)
+    thread.join.assert_called_once_with(timeout=0.0)
+    assert monitor._thread is thread and monitor._stop_event.is_set()
+    assert not monitor._pause_event.is_set() and not monitor._is_checking_enabled
+
+    thread.is_alive.return_value = False
+    monitor.stop(timeout=0.1)
+    assert monitor._thread is None and monitor._stop_event is None

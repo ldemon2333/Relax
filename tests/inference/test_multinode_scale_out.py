@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from relax.distributed.ray import inference_manager as core
+from relax.distributed.ray.rollout_scale_types import ScaleOutRequest, ScaleOutStatus
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
@@ -53,6 +54,8 @@ def _load_production(runtime, *, legacy_slots=False):
         "require_probe_cleanup": core.require_probe_cleanup,
         "ScaleOutFailure": ScaleOutFailure,
         "ScaleOutFailureCategory": ScaleOutFailureCategory,
+        "ScaleOutRequest": ScaleOutRequest,
+        "ScaleOutStatus": ScaleOutStatus,
         "validate_server_group_gpu_indices": validate_server_group_gpu_indices,
         "build_runai_streamer_env_for_load": build_runai_streamer_env_for_load,
         "PlacementGroupSchedulingStrategy": SimpleNamespace,
@@ -62,8 +65,6 @@ def _load_production(runtime, *, legacy_slots=False):
         "RolloutServer": Any,
     }
     names = (
-        "ScaleOutStatus",
-        "ScaleOutRequest",
         "EngineGroupLifecycle",
         "_EngineInitRecord",
         "EngineGroup",
