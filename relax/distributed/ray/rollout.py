@@ -1039,10 +1039,6 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
-    def stop_owned_routers(self) -> int:
-        """Stop Router subprocesses launched in this actor process."""
-        return stop_launched_routers()
-
     def dispose(self):
         try:
             # Signal every monitor before bounded joins so a stalled health
@@ -1058,7 +1054,7 @@ class RolloutManager(ReloadableMixin):
         finally:
             # Routers are child processes of this Ray actor, so its process
             # owns the registry; the Controller driver's registry is separate.
-            self.stop_owned_routers()
+            stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.

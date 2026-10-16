@@ -27,7 +27,6 @@ def test_rollout_manager_dispose_stops_owned_router_even_if_engine_shutdown_fail
             raise RuntimeError("engine shutdown failed")
 
     manager = SimpleNamespace(
-        stop_owned_routers=lambda: rollout.RolloutManager.stop_owned_routers.__func__(None),
         _stop_eviction_monitor=Mock(),
         _health_monitors=[],
         _shutdown_all_engines=Mock(side_effect=shutdown_engines),
