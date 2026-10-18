@@ -133,6 +133,29 @@ SC_ARGS=(
 
 需要内部 importance weighting 时，将 `--score-centering-is none` 改为 `--score-centering-is tis --score-centering-tis-clip 2.0`，或 `--score-centering-is mis --score-centering-mis-low 0.5 --score-centering-mis-high 5.0`；不额外开启 `--use-tis`。
 
+### 示例：运行八卡 Countdown 四组对照
+
+使用 [Qwen3-0.6B 八卡脚本](score-centering/run-qwen3-0.6B-8xgpu.sh)，按[实验记录中的准备步骤](score-centering/EXPERIMENT.md)准备 BF16/FP8 模型和 Countdown 数据，并包含其中列出的 SGD 兼容及 BF16 导出修复。从仓库根目录向专用八卡 Ray 集群提交 SC：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/countdown-data \
+SAVE_DIR=/path/to/checkpoints \
+RAY_ADDRESS=http://ray-head:8265 \
+USE_SC=1 USE_TIS=0 \
+bash scripts/entrypoint/ray-job.sh \
+  examples/algorithms/score-centering/run-qwen3-0.6B-8xgpu.sh
+```
+
+| USE_SC | USE_TIS | 算法                  |
+| ------ | ------- | --------------------- |
+| 0      | 0       | 原生 RLOO（脚本默认） |
+| 0      | 1       | 原生 RLOO + TIS       |
+| 1      | 0       | SC                    |
+| 1      | 1       | SC + 内部 TIS         |
+
+四组共用数据和训练设置：BF16 trainer、FP8 sampler、SGD lr=0.01，默认 400 步；SC 不要求使用 SGD。`RAY_ADDRESS` 填 Ray Jobs HTTP 地址。在线验证使用 FP8 sampler。每次独立运行应更换 `EXP_NAME`；当前 SGD 完整优化器恢复的限制见实验记录。
+
 ### 示例：运行 RLOO（文本）
 
 ```bash
