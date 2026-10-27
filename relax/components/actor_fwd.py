@@ -5,7 +5,6 @@ from argparse import Namespace
 from typing import Any, Optional
 
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
@@ -14,6 +13,7 @@ from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.inference.defer import wait_inference_commit
 from relax.utils.async_utils import run
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()
@@ -35,10 +35,12 @@ class ActorFwd(Base):
         # Threading primitives so the computation loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
         self._loop_runner = BackgroundLoopRunner()
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role=self.role,
+        )
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
-        ray.get(self.actor_model.async_init(config, role=self.role, with_ref=False))
+        self.actor_model.init_and_wait(config, role=self.role, with_ref=False)
         self.step = 0
 
     async def run(self) -> None:

@@ -12,6 +12,8 @@ from typing import Any
 
 STATIC_UPDATE_ENDPOINTS = frozenset(
     {
+        "begin_weight_update",
+        "end_weight_update",
         "update_weights_from_tensor",
         "update_weights_from_distributed",
         "init_weights_update_group",

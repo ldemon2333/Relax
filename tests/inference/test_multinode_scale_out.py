@@ -111,7 +111,7 @@ def _load_production(runtime, *, legacy_slots=False):
 def _server_args_for(engine, init):
     """Use the actual backend argument builder for the node-rank contract."""
     path = _ROOT / "relax/backends/sglang/sglang_engine.py"
-    names = {"_compute_server_args", "_to_local_gpu_id", "_enable_draft_weights_cpu_backup"}
+    names = {"_compute_server_args", "_to_local_gpu_id", "_enable_draft_weights_cpu_backup", "_server_arg_field_names"}
     nodes = [node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) in names]
     peft = _ROOT / "relax/utils/megatron_peft_utils.py"
     nodes.extend(node for node in ast.parse(peft.read_text()).body if getattr(node, "name", None) == "is_lora_enabled")

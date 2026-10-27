@@ -21,7 +21,7 @@ def restart_controller():
     path = Path(__file__).parents[2] / "relax/core/controller.py"
     tree = ast.parse(path.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    method_names = {"_confirm_inference_cleanup_for_restart", "_global_restart", "_run_global_restart"}
+    method_names = {"_confirm_inference_cleanup_for_restart", "restart_serve", "_run_global_restart"}
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in method_names]
     events = []
 
@@ -51,7 +51,6 @@ def restart_controller():
         "logger": MagicMock(),
         "recovery_load_path": lambda config: None,
         "shutdown_managed_opd_teacher": MagicMock(side_effect=lambda _: events.append(("kill_teacher",))),
-        "tq": SimpleNamespace(close=MagicMock()),
         "shutdown_async_loop": MagicMock(side_effect=RuntimeError("stop before Ray teardown")),
     }
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
@@ -65,11 +64,17 @@ def restart_controller():
     instance._health_manager = SimpleNamespace(_checker=None, stop=MagicMock())
     instance._cancel_pending_tasks = MagicMock()
     instance._restart_done_event = threading.Event()
+    instance._restart_consumed_event = threading.Event()
+    instance._restart_consumed_event.set()
+    instance._restart_lock = threading.RLock()
+    # Isolate the global branch while exercising the current recovery wrapper.
+    instance._restart_serve = lambda role: instance._run_global_restart()
     instance._restart_error = None
     instance._shutdown_teacher_gateway = MagicMock(side_effect=lambda: events.append(("delete_gateway",)))
     instance._shutdown_genrm_managers = MagicMock(side_effect=lambda: events.append(("kill_genrm",)))
     instance._shutdown_inference_coordinator = MagicMock(side_effect=lambda: events.append(("kill_coordinator",)))
     instance._shutdown_agentic_rollout_services = MagicMock()
+    instance._close_data_system = MagicMock()
     instance._metrics_service_enabled = False
     instance._autoscaler_config = None
     instance._owned_actor_inference_pg = object()
@@ -211,7 +216,7 @@ def test_global_restart_unconfirmed_backend_preserves_fence_and_signals_main_thr
     owner_pg = controller._owned_actor_inference_pg
     services = dict(controller.serve_dict)
 
-    controller._global_restart()
+    controller.restart_serve("actor")
 
     assert isinstance(controller._restart_error, InferenceRecoveryRequired)
     assert "operator" in str(controller._restart_error)
